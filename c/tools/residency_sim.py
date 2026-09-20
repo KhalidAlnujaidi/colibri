@@ -505,13 +505,186 @@ class HalfPinnedLRUPolicy(BasePolicy):
             self.stats.admissions += 1
 
 
+class MarkovPrefetchPolicy(BasePolicy):
+    """LRU plus an order-1 Markov bias: predict layer L+1 from layer L's routing.
+
+    Unlike the other policies here this one is *cross-layer*, and that is the
+    whole point. Every policy above decides layer L's victim from state it
+    observed at layer L — heat, recency, frequency. The Markov table says which
+    experts layer L+1 is about to ask for, so an expert that layer L just routed
+    can promote its predicted successors before layer L+1 runs. On a disk-bound
+    engine that is the difference between a load the compute can hide and one it
+    stalls on.
+
+    The model is the same one `COUPLE=` uses in the engine: score a candidate by
+    summing transition counts over the experts the conditioning layer chosen, so
+    a successor reached from several of them ranks above one reached from a
+    single rare predecessor.
+
+    Placement only. `lookup` still answers exactly "is this expert resident", so
+    a miss is still a miss and the byte budget still binds; the table changes
+    *which* experts are kept, never which ones the layer routes. The gate this
+    ultimately feeds is a runtime A/B, and this class is the cheap rejection test
+    for it (docs/experiments/cnre-offline-simulator.md, Phase-0 gate).
+
+    `confidence` is the count a predicted successor needs before it may displace
+    an unpredicted resident. With no table, or below confidence, this is exactly
+    LRU — that fallback is deliberate: a low-confidence route must not be able to
+    evict a hot expert on a guess.
+    """
+
+    def __init__(self, capacities, specs, learned_counts=None,
+                 table=None, pin_fraction=0.5, confidence=1.0, depth=1):
+        super().__init__(capacities, specs, learned_counts)
+        self.table = table or {}
+        self.confidence = confidence
+        self.depth = depth                      # 1 = next layer only (order-1 v1)
+        self.cache: dict[int, OrderedDict[int, None]] = defaultdict(OrderedDict)
+        # Pinned = the top `pin_fraction` of each layer by learned heat, exactly
+        # HalfPinnedLRUPolicy's rule. Kept here so a Markov win cannot come from
+        # the pinning rule differing between arms.
+        self.pins: dict[int, set[int]] = defaultdict(set)
+        self.adaptive_capacity = {}
+        for layer, capacity in capacities.items():
+            pin_count = min(capacity, int(capacity * pin_fraction))
+            counts = learned_counts.get(layer, {})
+            ranked = sorted(counts, key=lambda e: (-counts[e], e))[:pin_count]
+            self.pins[layer].update(ranked)
+            self.adaptive_capacity[layer] = capacity - len(ranked)
+            self.stats.seeded_objects += len(ranked)
+        self.predicted: dict[int, dict[int, float]] = {}
+        self.predictions = 0
+
+    def lookup(self, layer, expert):
+        if expert in self.pins[layer]:
+            return True
+        cache = self.cache[layer]
+        if expert not in cache:
+            return False
+        cache.move_to_end(expert)
+        return True
+
+    def predict(self, layer, experts):
+        """Rank layer+1 candidates from `experts` routed at `layer`.
+
+        Scores sum over the conditioning set, so a successor several observed
+        experts agree on outranks one only a single rare expert points at. Only
+        the next layer is predicted (order 1).
+        """
+        scores: dict[int, float] = {}
+        for e in experts:
+            for f, count in self.table.get((layer, e), ()):
+                if count < self.confidence:
+                    continue
+                scores[f] = scores.get(f, 0.0) + count
+        self.predicted[layer + self.depth] = scores
+        self.predictions += len(scores)
+
+    def admit_batch(self, layer, misses):
+        """HalfPinnedLRU's admission, with predicted successors admitted first.
+
+        The no-table path is deliberately byte-identical to
+        HalfPinnedLRUPolicy.admit_batch, so a `markov` arm with an empty table
+        reproduces `half-pinned` exactly and any difference between the two arms
+        is attributable to the table. That equality is asserted by
+        tests/test_residency_sim.py — it is the control that makes the Stage-A
+        result mean anything, and the first version of this method failed it
+        (15344 vs 15324 misses over the same 4000 events) because it called
+        move_to_end on the pinned/cached path and reordered by score even when
+        there was no score to reorder by.
+        """
+        capacity = self.adaptive_capacity.get(layer, 0)
+        if capacity <= 0:
+            self.stats.rejected_admissions += len(misses)
+            return
+        scores = self.predicted.get(layer, {})
+        ordered = misses
+        if scores:
+            # Admit predicted successors first, then demand order. Only when the
+            # table has something to say: with no scores this must stay `misses`.
+            ordered = sorted(misses, key=lambda e: -scores.get(e, 0.0))
+        selected = list(ordered[-capacity:])
+        self.stats.rejected_admissions += len(misses) - len(selected)
+        cache = self.cache[layer]
+        pins = self.pins[layer]
+        for expert in reversed(selected):
+            if expert in pins or expert in cache:
+                continue
+            while len(cache) >= capacity:
+                victim = self._victim(layer, cache, pins, scores)
+                if victim is None:
+                    break
+                del cache[victim]
+                self.stats.evictions += 1
+            cache[expert] = None
+            self.stats.admissions += 1
+
+    def _victim(self, layer, cache, pins, scores):
+        """LRU (oldest first) — except that an unpredicted resident is evicted
+        ahead of a predicted one. With no scores this is exactly
+        HalfPinnedLRUPolicy's `cache.popitem(last=False)`."""
+        oldest = [e for e in cache if e not in pins]
+        if not oldest:
+            return None
+        if scores:
+            unpredicted = [e for e in oldest if e not in scores]
+            if unpredicted:
+                return unpredicted[0]
+        return oldest[0]
+
+    def access(self, event):
+        """`BasePolicy.access` plus the prediction step after the layer routes.
+
+        The prediction is made from the union the layer actually chose, which is
+        what the engine has when it decides to prefetch the next layer — the
+        same trigger point as PILOT/COUPLE, so the simulator and the runtime
+        would condition on identical information.
+        """
+        super().access(event)
+        if event.experts:
+            self.predict(event.layer, event.experts)
+
+
 POLICIES = {
     "lru": LRUPolicy,
     "half-pinned": HalfPinnedLRUPolicy,
     "lfu": LFUPolicy,
     "slru": SLRUPolicy,
     "frequency": FrequencyAdmissionPolicy,
+    "markov": MarkovPrefetchPolicy,
 }
+
+
+# The Markov table and its confidence threshold. Set once by the CLI; the
+# `markov` policy reads them in run_policy. Module-level because the table
+# describes the model under test, not any one replay.
+MARKOV_TABLE = None
+MARKOV_CONFIDENCE = 1.0
+
+
+def load_markov_table(path):
+    """Read a COLIMARKOV table (tools/route_markov.py) into the policy's shape.
+
+    -> {(layer, expert): [(successor, count), ...]} in file order, which is
+    count-descending, so callers may truncate to a prefetch budget.
+    """
+    table: dict[tuple[int, int], list[tuple[int, float]]] = {}
+    with open(path, encoding="utf-8") as fh:
+        header = fh.readline().split()
+        if not header or header[0] != "COLIMARKOV":
+            raise ValueError(f"{path}: not a COLIMARKOV table")
+        for lineno, raw in enumerate(fh, 2):
+            fields = raw.split()
+            if not fields:
+                continue
+            try:
+                layer, expert = int(fields[0]), int(fields[1])
+                succ = [(int(v.split(":")[0]), float(v.split(":")[1]))
+                        for v in fields[2:]]
+            except (ValueError, IndexError) as error:
+                raise ValueError(f"{path}:{lineno}: malformed row") from error
+            table[(layer, expert)] = succ
+    return table
 
 
 def training_counts(traces):
@@ -523,7 +696,16 @@ def training_counts(traces):
 
 
 def run_policy(policy_name, capacities, specs, trace, learned_counts=None):
-    policy = POLICIES[policy_name](capacities, specs, learned_counts)
+    kwargs = {}
+    if policy_name == "markov":
+        # The table is a property of the model, not of the replay, so it arrives
+        # through the module rather than through every call site. Only this one
+        # policy takes it; every other class keeps its exact signature.
+        if MARKOV_TABLE is None:
+            raise ValueError("the markov policy needs --markov-table")
+        kwargs["table"] = MARKOV_TABLE
+        kwargs["confidence"] = MARKOV_CONFIDENCE
+    policy = POLICIES[policy_name](capacities, specs, learned_counts, **kwargs)
     for event in trace:
         policy.access(event)
     return policy.stats
@@ -1196,6 +1378,10 @@ def add_real_trace_arguments(parser):
                         help="limit cost sensitivity to selected layers")
     parser.add_argument("--prof-log", type=Path, action="append", default=[],
                         help="GLM PROF=1 log used for aggregate cost calibration")
+    parser.add_argument("--markov-table", type=Path,
+                        help="COLIMARKOV table (tools/route_markov.py) for --policies markov")
+    parser.add_argument("--markov-confidence", type=float, default=1.0,
+                        help="minimum transition count before a prediction may evict")
     parser.add_argument("--policies", nargs="+", choices=tuple(POLICIES),
                         default=list(POLICIES))
     parser.add_argument("--json-out", type=Path)
@@ -1235,6 +1421,14 @@ def main():
         parser.error("--max-training-events must be non-negative")
     if hasattr(args, "policies") and "lru" not in args.policies:
         parser.error("--policies must include lru as the decision-gate baseline")
+    if hasattr(args, "policies") and "markov" in args.policies:
+        if not getattr(args, "markov_table", None):
+            parser.error("--policies markov requires --markov-table")
+        global MARKOV_TABLE, MARKOV_CONFIDENCE
+        MARKOV_TABLE = load_markov_table(args.markov_table)
+        MARKOV_CONFIDENCE = args.markov_confidence
+        print(f"markov: {len(MARKOV_TABLE)} conditioning entries from "
+              f"{args.markov_table}, confidence >= {MARKOV_CONFIDENCE:g}")
     try:
         args.func(args)
     except (OSError, ValueError, json.JSONDecodeError) as error:

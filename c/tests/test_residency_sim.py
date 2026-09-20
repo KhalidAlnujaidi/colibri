@@ -475,5 +475,71 @@ class DecisionGateTest(unittest.TestCase):
         self.assertTrue(frequency[12]["pass_sensitivity"])
 
 
+    # ---- markov policy (Stage A) -------------------------------------------
+
+    def test_markov_without_a_table_reproduces_half_pinned_exactly(self):
+        """The control that makes a markov A/B attributable to the table.
+
+        `markov` shares half-pinned's pins and capacities by construction. If its
+        admission path also matches byte-for-byte when the table is empty, then
+        any difference between the two arms in an experiment is caused by the
+        predictions and nothing else. Without this test that claim is a comment:
+        the first implementation of admit_batch missed 20 extra times in 4000
+        events (15344 vs 15324) purely from LRU bookkeeping.
+        """
+        train, evaluation, specs, budget, _categories = sim.synthetic_category_suite()
+        counts = sim.training_counts(train)
+        capacities = sim.uniform_capacities(specs, budget)
+        half = sim.HalfPinnedLRUPolicy(capacities, specs, counts)
+        sim.MARKOV_TABLE = {}
+        sim.MARKOV_CONFIDENCE = 1.0
+        markov = sim.MarkovPrefetchPolicy(capacities, specs, counts, table={})
+        for trace in evaluation:
+            for event in trace:
+                half.access(event)
+                markov.access(event)
+        self.assertEqual(half.stats.misses, markov.stats.misses)
+        self.assertEqual(half.stats.evictions, markov.stats.evictions)
+        self.assertEqual(half.stats.admissions, markov.stats.admissions)
+        for layer in capacities:
+            self.assertEqual(list(half.cache[layer]), list(markov.cache[layer]))
+
+    def test_markov_requires_a_table_to_be_loaded(self):
+        train, evaluation, specs, budget, _categories = sim.synthetic_category_suite()
+        sim.MARKOV_TABLE = None
+        with self.assertRaises(ValueError):
+            sim.run_policy("markov", sim.uniform_capacities(specs, budget),
+                           specs, evaluation[0])
+
+    def test_markov_table_round_trips_and_scores_summation(self):
+        """Summing counts over the conditioning set must outrank a single rare
+        predecessor: that mixture is the whole reason the table is not just a
+        per-expert top-N lookup."""
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.table"
+            path.write_text("COLIMARKOV 1 2\n"
+                            "0 1 7:5 8:1\n"
+                            "0 2 7:5 9:1\n")
+            table = sim.load_markov_table(path)
+            self.assertEqual(table[(0, 1)][0], (7, 5.0))
+            sim.MARKOV_TABLE = table
+            policy = sim.MarkovPrefetchPolicy({0: 4, 1: 4}, {}, {}, table=table)
+            policy.predict(0, (1, 2, 3))
+            # 7 is reached from both 1 and 2, so it outscores 8 and 9.
+            self.assertEqual(policy.predicted[1][7], 10.0)
+            self.assertGreater(policy.predicted[1][7], policy.predicted[1][8])
+
+    def test_load_markov_table_rejects_a_foreign_format(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "other.table"
+            path.write_text("COLIPAIRS 1 1\n0 1 5 7:3\n")
+            with self.assertRaises(ValueError):
+                sim.load_markov_table(path)
+
+
 if __name__ == "__main__":
     unittest.main()
