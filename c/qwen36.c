@@ -61,6 +61,7 @@ static int qwen36_max_ctx(void) {
 #include "cli_args.h"
 #include "st.h"
 #include "json.h"   /* tokenizer.json parsing (reuse minimal parser) */
+#include "route_trace.h"     /* shared ROUTE_TRACE + .coli_usage contract */
 #include "qwen36_tier.h"   /* optional transparent Vulkan compute backend for MoE experts */
 #ifdef COLI_SEGMENT_ADAPTER
 #include "segment_runtime.h"
@@ -659,6 +660,13 @@ static volatile unsigned pilot_r = 0, pilot_w = 0;
 static Model *pilot_m = NULL;
 static int g_pilot = 0;
 static int g_wide  = 1;
+/* PILOT_S_MAX: the largest prefill batch S for which PILOT prefetches. Default 8 is the
+ * historical constant spelled `S <= 8` at the three dispatch sites below; raising it lets
+ * PILOT fire on large prefill batches, where the disk read is NOT hidden behind compute
+ * (measured: prefetch cuts TTFT ~20% but leaves decode flat, because decode is I/O-hidden
+ * and prefill is not). S<=0 disables the gate entirely. Kept as a knob so the default
+ * stays byte-identical and an A/B is a one-variable change. */
+static int g_pilot_s_max = 8;
 
 static void pilot_prefetch(Model *m, int lnext, const float *x, int S);
 static void *pilot_worker(void *arg);
@@ -1388,6 +1396,17 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
         m->DN_conv[i] = calloc((size_t)c->dn_conv_dim * (c->dn_convk - 1), sizeof(float));
     }
     m->freq = calloc((size_t)c->n_layers * c->n_experts, sizeof(uint32_t));
+    /* ROUTE_TRACE / .coli_usage ownership (route_trace.h). qwen36 keeps its own freq
+     * array as the counter row so no reader changes shape; rt_init is what lets the
+     * engine emit the ROUTE_TRACE stream and share the .coli_usage format with every
+     * other engine. Every qwen36 layer routes (both Gated Attention and Gated DeltaNet
+     * carry a MoE block), and there is no MTP row, so the extra row is dropped —
+     * the same rule olmoe.c and qwen38.c follow.
+     *
+     * Note rt_route writes only when ROUTE_TRACE is set and the row is non-NULL, so
+     * this is inert on a normal run. It is measurement, never computation. */
+    rt_init("qwen36", c->n_layers, c->n_experts);
+    rt_drop_row(c->n_layers);
     m->hot_pinned = 0; m->freq_token_count = 0;
     m->hot_n         = getenv("HOT")    ? atoi(getenv("HOT"))    : 0;
     m->warmup_tokens = getenv("WARMUP") ? atoi(getenv("WARMUP")) : 5;
@@ -1992,6 +2011,18 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
             uint32_t *freq_l = m->freq + (int64_t)layer * E;
             for (int kk = 0; kk < K; kk++) if (idx[kk] >= 0) freq_l[idx[kk]]++;
         }
+        /* ROUTE_TRACE stream (route_trace.h). Same placement rule as olmoe.c: after the
+         * top-k selection and the HF renormalization, so idx[] and val[] are exactly the
+         * ids and gates the layer is about to apply.
+         *
+         * rt_route is deliberately unconditional here for the same reason it is in
+         * olmoe.c: it is a no-op for the counters when this engine has no counter row
+         * (the !hot_pinned guard above is unchanged) and a no-op for the trace when
+         * ROUTE_TRACE is unset, so a run without the variable behaves exactly as before.
+         * Measurement only — it cannot change which experts run, so it cannot change a
+         * token. Before this call qwen36 called neither rt_route nor rt_trace, so
+         * ROUTE_TRACE produced a 0-byte file: the same defect #1630 fixed in olmoe.c. */
+        if (!m->hot_pinned) rt_route(layer, s, idx, val, K);
         const float *xs = x + (int64_t)s*D;
         if (use_qt) {
             /* CUDA expert tier: run the resident experts as async groups on
@@ -2064,6 +2095,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out) {
      * once per bounded chunk. */
     if (!use_qt) qwen_shared_experts_cpu(m,l,x,S,out,sh,shu,shd);
     free(logits); free(g); free(u); free(hh); free(sh); free(shu); free(shd);
+    /* Advance the ROUTE_TRACE call counter once per moe() invocation (not per row), so
+     * the first field of every trace line identifies the forward. Mirrors olmoe.c; a
+     * zero-row batch still advances it, which is why this sits outside the row loop. */
+    rt_trace_end();
 }
 
 /* Gated DeltaNet (linear_attention) forward — recurrent gated-delta-rule.
@@ -2260,7 +2295,7 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         if (lf) fwrite(tmp + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* sublayer output */
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);   /* post-deltanet residual */
-        if (allow_prefetch && g_pilot >= 1 && S <= 8 && i + 1 < c->n_layers)
+        if (allow_prefetch && g_pilot >= 1 && S <= g_pilot_s_max && i + 1 < c->n_layers)
             pilot_prefetch(m, i + 1, x, S);
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
         _t0 = tm_now();
@@ -2268,9 +2303,9 @@ static void layers_forward_range(Model *m, float *x, int S, int pos_base,
         tm_add(S, 2, tm_now()-_t0);
         for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
         if (lf) fwrite(x + (int64_t)(S-1)*D, sizeof(float), D, lf);
-        if (allow_prefetch && g_pilot >= 2 && S <= 8 && i + 2 < c->n_layers)
+        if (allow_prefetch && g_pilot >= 2 && S <= g_pilot_s_max && i + 2 < c->n_layers)
             pilot_prefetch(m, i + 2, x, S);
-        if (allow_prefetch && g_pilot >= 3 && S <= 8 && i + 3 < c->n_layers)
+        if (allow_prefetch && g_pilot >= 3 && S <= g_pilot_s_max && i + 3 < c->n_layers)
             pilot_prefetch(m, i + 3, x, S);
     }
     free(nrm); free(tmp);
@@ -2856,6 +2891,7 @@ int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { coli_print_launcher_help("Qwen3.6"); return 1; }
     g_pilot = getenv("PILOT") ? atoi(getenv("PILOT")) : 0;
+    g_pilot_s_max = getenv("PILOT_S_MAX") ? atoi(getenv("PILOT_S_MAX")) : 8;
     g_wide  = getenv("WIDE")  ? atoi(getenv("WIDE"))  : 1;
     if (g_wide < 1) g_wide = 1; if (g_wide > 4) g_wide = 4;
     if (getenv("OPENAI")) g_openai = 1;                       /* OpenAI-compatible output */
