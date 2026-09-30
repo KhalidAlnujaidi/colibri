@@ -99,6 +99,9 @@ static inline void omp_set_num_threads(int n){ (void)n; }
 #include "edge_adapters.h"
 #include "edge_tok_internal.h"
 #endif
+#ifdef COLI_ENGINE_ADAPTER
+#include "engine.h"
+#endif
 #ifdef COLI_CUDA
 #include "backend_cuda.h"
 #endif
@@ -12757,3 +12760,368 @@ int coli_glm_edge_adapter_register(void) {
     return coli_edge_adapter_register(&glm_edge_adapter);
 }
 #endif /* COLI_EDGE_ADAPTER */
+
+#ifdef COLI_ENGINE_ADAPTER
+/* ---------- unified engine ABI (engine.h): reference backend ------------ */
+/* The full-token engine contract. This block wraps the complete GLM model
+ * (all layers + KV cache) behind engine.h, so an external harness can drive
+ * prefill/decode/kv_rollback through function calls instead of the pipe
+ * SUBMIT/DATA/DONE loop. It mirrors the ColiSegmentAdapter/ColiEdgeAdapter
+ * vtable pattern above; only colibri.c registers it (other families can adopt
+ * the same ABI later). */
+
+typedef struct {
+    Model model;
+    Tok tokenizer;
+    int  pos;                     /* KV position cursor (position-addressed KV) */
+} ColiEngineRef;
+
+static void glm_engine_qt_destroy(QT *tensor) {
+    if (!tensor) return;
+    if (tensor->mmap_view) return;    /* #826: never free a file-backed view */
+    free(tensor->qf); free(tensor->q8); free(tensor->q4); free(tensor->s);
+    memset(tensor, 0, sizeof(*tensor));
+}
+
+static void glm_engine_eslot_destroy(ESlot *slot) {
+    if (!slot) return;
+    if (slot->slab || slot->fslab || slot->aslab) {
+        if (slot->aslab) {
+            slot->slab = NULL; slot->fslab = NULL;
+        } else {
+            compat_aligned_free(slot->slab);
+            free(slot->fslab);
+        }
+    } else {
+        glm_engine_qt_destroy(&slot->g);
+        glm_engine_qt_destroy(&slot->u);
+        glm_engine_qt_destroy(&slot->d);
+    }
+    memset(slot, 0, sizeof(*slot));
+}
+
+static void glm_engine_layer_destroy(Layer *layer) {
+    if (!layer) return;
+    free(layer->in_ln); free(layer->post_ln);
+    free(layer->q_a_ln); free(layer->kv_a_ln);
+    glm_engine_qt_destroy(&layer->q_a);
+    glm_engine_qt_destroy(&layer->q_b);
+    glm_engine_qt_destroy(&layer->kv_a);
+    glm_engine_qt_destroy(&layer->kv_b);
+    glm_engine_qt_destroy(&layer->o);
+    if (layer->sparse) {
+        free(layer->router); free(layer->router_bias);
+        glm_engine_qt_destroy(&layer->sh_gate);
+        glm_engine_qt_destroy(&layer->sh_up);
+        glm_engine_qt_destroy(&layer->sh_down);
+    } else {
+        glm_engine_qt_destroy(&layer->gate_proj);
+        glm_engine_qt_destroy(&layer->up_proj);
+        glm_engine_qt_destroy(&layer->down_proj);
+    }
+}
+
+static void glm_engine_kv_destroy(KVState *state, int num_layers) {
+    if (!state) return;
+    int rows = num_layers + 1;
+    if (state->Lc || state->Rc)
+        for (int layer = 0; layer < rows; layer++) {
+            free(state->Lc ? state->Lc[layer] : NULL);
+            free(state->Rc ? state->Rc[layer] : NULL);
+        }
+    if (state->Lc8 || state->Rc8 || state->Lsc || state->Rsc)
+        for (int layer = 0; layer < rows; layer++) {
+            free(state->Lc8 ? state->Lc8[layer] : NULL);
+            free(state->Rc8 ? state->Rc8[layer] : NULL);
+            free(state->Lsc ? state->Lsc[layer] : NULL);
+            free(state->Rsc ? state->Rsc[layer] : NULL);
+        }
+    if (state->Ic)
+        for (int layer = 0; layer < num_layers; layer++) free(state->Ic[layer]);
+    free(state->Lc); free(state->Rc); free(state->Ic);
+    free(state->Lc8); free(state->Rc8);
+    free(state->Lsc); free(state->Rsc); free(state->kv_start);
+    if (state->disk_fp) fclose(state->disk_fp);
+    free(state->disk_buf);
+    memset(state, 0, sizeof(*state));
+}
+
+static int glm_engine_error(char *error, size_t error_size, const char *message) {
+    if (error && error_size) snprintf(error, error_size, "%s", message);
+    return -1;
+}
+
+static void glm_engine_cap_string(char *out, size_t cap, const char *value) {
+    if (!out || !cap) return;
+    size_t n = strlen(value);
+    if (n >= cap) n = cap - 1;
+    memcpy(out, value, n);
+    out[n] = '\0';
+}
+
+/* Full-model teardown (mirrors glm_segment_model_destroy over the whole
+ * layer range; self-contained so this block does not depend on the segment
+ * adapter being compiled in). */
+static void glm_engine_model_destroy(ColiEngineRef *engine) {
+    if (!engine) return;
+    Model *model = &engine->model;
+    int rows = model->c.n_layers + 1;
+    for (int layer = 0; layer < model->c.n_layers; layer++) {
+        glm_engine_layer_destroy(&model->L[layer]);
+        if (model->ecache && model->ecache[layer])
+            for (int slot = 0; slot < model->ecap; slot++)
+                glm_engine_eslot_destroy(&model->ecache[layer][slot]);
+        if (model->pin && model->pin[layer])
+            for (int slot = 0; slot < model->npin[layer]; slot++)
+                glm_engine_eslot_destroy(&model->pin[layer][slot]);
+        free(model->ecache ? model->ecache[layer] : NULL);
+        free(model->pin ? model->pin[layer] : NULL);
+        free(model->eroute ? model->eroute[layer] : NULL);
+        free(model->eheat ? model->eheat[layer] : NULL);
+        free(model->elast ? model->elast[layer] : NULL);
+        free(model->elast_dc ? model->elast_dc[layer] : NULL);
+        free(model->elast_pre ? model->elast_pre[layer] : NULL);
+    }
+    for (size_t slot = 0; slot < sizeof(model->ws) / sizeof(model->ws[0]); slot++)
+        glm_engine_eslot_destroy(&model->ws[slot]);
+    for (int layer = 0; layer < rows; layer++) {
+        free(model->ecache_slot_by_expert ? model->ecache_slot_by_expert[layer] : NULL);
+        free(model->pin_slot_by_expert ? model->pin_slot_by_expert[layer] : NULL);
+    }
+    if (model->has_dsa) {
+        for (int layer = 0; layer < model->c.n_layers; layer++)
+            if (model->c.idx_type[layer]) {
+                glm_engine_qt_destroy(&model->ix_wq[layer]);
+                glm_engine_qt_destroy(&model->ix_wk[layer]);
+                glm_engine_qt_destroy(&model->ix_wp[layer]);
+                free(model->ix_knw[layer]); free(model->ix_knb[layer]);
+            }
+    }
+    glm_engine_qt_destroy(&model->embed);
+    glm_engine_qt_destroy(&model->lm_head);
+    free(model->final_norm); free(model->hlast); free(model->h_all);
+    free(model->ix_wq); free(model->ix_wk); free(model->ix_wp);
+    free(model->ix_knw); free(model->ix_knb);
+    free(model->dsa_sel); free(model->dsa_nsel);
+    if (model->kv) {
+        glm_engine_kv_destroy(model->kv, model->c.n_layers);
+        free(model->kv);
+    }
+    free(model->ecache); free(model->ecn);
+    free(model->ecache_slot_by_expert);
+    free(model->pin); free(model->npin); free(model->pin_slot_by_expert);
+    free(model->eheat); free(model->elast);
+    free(model->elast_dc); free(model->elast_pre);
+    free(model->eroute); free(model->enr);
+    free(model->eusage);
+    free(model->kv_dev_L); free(model->kv_dev_R); free(model->kv_dev_valid);
+    free(model->ln_dev);
+#ifdef COLI_VULKAN
+    free(model->vk_kv_valid);
+#endif
+    free(model->L);
+    st_destroy(&model->S);
+    model->kv = NULL;
+}
+
+static void glm_engine_destroy(void *engine_impl) {
+    ColiEngineRef *engine = (ColiEngineRef *)engine_impl;
+    if (!engine) return;
+    glm_engine_model_destroy(engine);
+    tok_free(&engine->tokenizer);
+    free(engine);
+}
+
+static int glm_engine_open(void **engine_impl, ColiEngineCapabilities *capabilities,
+                           const ColiEngineOptions *options,
+                           char *error, size_t error_size) {
+    if (!engine_impl || !capabilities || !options)
+        return glm_engine_error(error, error_size, "invalid GLM engine open");
+    *engine_impl = NULL;
+    if (options->backend_mask &&
+        (options->backend_mask & ~COLI_ENGINE_CAP_CPU))
+        return glm_engine_error(error, error_size,
+                                "GLM engine currently supports CPU");
+    /* Bit widths only matter for RAW (non-quantized) tensors: a container with
+     * .qs sidecars resolves its own format and ignores these. 16 = load raw
+     * f32/bf16 tensors at full precision, matching how the tiny oracle fixtures
+     * are run (`./colibri 64 16 16`). Override for int4/int8 containers without
+     * sidecars via COLI_ENGINE_EBITS / COLI_ENGINE_DBITS. */
+    int ebits = getenv("COLI_ENGINE_EBITS") ? atoi(getenv("COLI_ENGINE_EBITS")) : 16;
+    int dbits = getenv("COLI_ENGINE_DBITS") ? atoi(getenv("COLI_ENGINE_DBITS")) : 16;
+    if (ebits < 2 || ebits > 16 || dbits < 2 || dbits > 16)
+        return glm_engine_error(error, error_size,
+                                "GLM engine bit widths must be 2..16");
+    int cap = 8;
+
+    ColiEngineRef *engine = calloc(1, sizeof(*engine));
+    if (!engine)
+        return glm_engine_error(error, error_size,
+                                "out of memory opening GLM engine");
+    /* main() calls this before anything else; COLIBRI_NO_MAIN removes that call,
+     * so a library consumer would otherwise run at the OpenMP default (one
+     * thread per logical CPU) and lose to SMT contention (#718: up to 2x). */
+    coli_omp_tune_threads("glm");
+    /* Full model (all layers, mmap allowed) — same shape as model_init(). */
+    model_init_range(&engine->model, options->model_dir, cap, ebits, dbits,
+                     0, 0, 1, 1, 1, 1);
+    engine->pos = 0;
+
+    /* The KV row buffers (Lc/Rc/Ic) are NOT allocated by model_init_range:
+     * every engine entry point calls kv_alloc() before its first forward
+     * (run_text, run_serve, generate, ...). The ABI must do the same or the
+     * first attention reads NULL rows. Context size mirrors the serve default
+     * (CTX, 4096) and is overridable for the harness. */
+    int maxctx = getenv("COLI_ENGINE_CTX") ? atoi(getenv("COLI_ENGINE_CTX")) : 4096;
+    if (maxctx < 1) maxctx = 1;
+    kv_alloc(&engine->model, maxctx);
+
+    char tokenizer_path[4096];
+    snprintf(tokenizer_path, sizeof(tokenizer_path), "%s/tokenizer.json",
+             options->model_dir);
+    tok_load(&engine->tokenizer, tokenizer_path);
+
+    memset(capabilities, 0, sizeof(*capabilities));
+    capabilities->struct_size = sizeof(*capabilities);
+    capabilities->abi_version = COLI_ENGINE_ABI_VERSION;
+    capabilities->flags = COLI_ENGINE_CAP_PREFILL | COLI_ENGINE_CAP_DECODE |
+                          COLI_ENGINE_CAP_KV_SURGERY | COLI_ENGINE_CAP_CPU;
+    glm_engine_cap_string(capabilities->engine_id,
+                          sizeof(capabilities->engine_id), "glm");
+    glm_engine_cap_string(capabilities->state_schema,
+                          sizeof(capabilities->state_schema),
+                          "glm/mla-rope-dsa-kv-v1");
+    snprintf(capabilities->numeric_class, sizeof(capabilities->numeric_class),
+             "glm/e%d-d%d/cpu-v1", ebits, dbits);
+    glm_engine_cap_string(capabilities->tokenizer_class,
+                          sizeof(capabilities->tokenizer_class),
+                          "glm/cl100k-byte-bpe-v1");
+    capabilities->vocab_size = (uint32_t)engine->model.c.vocab;
+    capabilities->hidden_size = (uint32_t)engine->model.c.hidden;
+    capabilities->num_layers = (uint32_t)engine->model.c.n_layers;
+    capabilities->max_context_tokens = (uint32_t)maxctx;
+    capabilities->bos_token_id = -1;
+    capabilities->eos_token_id = -1;
+    capabilities->resident_bytes = (uint64_t)engine->model.resident_bytes;
+    *engine_impl = engine;
+    return 0;
+}
+
+static int glm_engine_tokenize(void *engine_impl, const char *text, size_t text_bytes,
+                               int32_t *token_ids, size_t token_capacity,
+                               size_t *token_count, char *error, size_t error_size) {
+    ColiEngineRef *engine = (ColiEngineRef *)engine_impl;
+    if (!text || !token_count || (!!token_ids != !!token_capacity))
+        return glm_engine_error(error, error_size,
+                                "invalid GLM tokenize request");
+    int max = token_capacity > INT_MAX ? INT_MAX : (int)token_capacity;
+    int n = tok_encode(&engine->tokenizer, text, (int)text_bytes,
+                       (int*)token_ids, max);
+    *token_count = (size_t)n;
+    return 0;
+}
+
+static int glm_engine_detokenize(void *engine_impl, const int32_t *token_ids,
+                                 size_t token_count, char *text, size_t text_capacity,
+                                 size_t *text_bytes, char *error, size_t error_size) {
+    ColiEngineRef *engine = (ColiEngineRef *)engine_impl;
+    if (!token_ids || !token_count || !text_bytes || (!!text != !!text_capacity))
+        return glm_engine_error(error, error_size,
+                                "invalid GLM detokenize request");
+    int max = text_capacity > INT_MAX ? INT_MAX : (int)text_capacity;
+    int n = tok_decode(&engine->tokenizer, (const int*)token_ids,
+                       (int)token_count, text, max);
+    *text_bytes = (size_t)n;
+    return 0;
+}
+
+static int glm_engine_prefill(void *engine_impl, const int32_t *tokens, size_t n_tokens,
+                              float **logits, char *error, size_t error_size) {
+    ColiEngineRef *engine = (ColiEngineRef *)engine_impl;
+    if (!tokens || !n_tokens || !logits)
+        return glm_engine_error(error, error_size, "invalid GLM prefill request");
+    int n = n_tokens > INT_MAX ? INT_MAX : (int)n_tokens;
+    if (engine->pos + n > engine->model.max_t)
+        return glm_engine_error(error, error_size,
+                                "GLM prefill exceeds the allocated context");
+    *logits = step(&engine->model, (const int*)tokens, n, engine->pos);
+    engine->pos += n;
+    return 0;
+}
+
+static int glm_engine_decode_step(void *engine_impl, int32_t token_id, float **logits,
+                                  char *error, size_t error_size) {
+    ColiEngineRef *engine = (ColiEngineRef *)engine_impl;
+    if (!logits || token_id < 0 || token_id >= engine->model.c.vocab)
+        return glm_engine_error(error, error_size, "invalid GLM decode request");
+    if (engine->pos >= engine->model.max_t)
+        return glm_engine_error(error, error_size,
+                                "GLM decode exceeds the allocated context");
+    int tok = token_id;
+    *logits = step(&engine->model, &tok, 1, engine->pos);
+    engine->pos += 1;
+    return 0;
+}
+
+static int glm_engine_sample(void *engine_impl, const float *logits,
+                             const ColiSampleConfig *cfg, int32_t *token_id,
+                             char *error, size_t error_size) {
+    ColiEngineRef *engine = (ColiEngineRef *)engine_impl;
+    if (!logits || !cfg || !token_id)
+        return glm_engine_error(error, error_size, "invalid GLM sample request");
+    int V = engine->model.c.vocab;
+    /* Apply the harness sampling policy to the engine's shared samplers. */
+    g_temp = (cfg->temperature > 0.0f) ? cfg->temperature : 0.0f;
+    g_nuc  = (cfg->top_p > 0.0f && cfg->top_p < 1.0f) ? cfg->top_p : 0.0f;
+    int next = pick_tok(logits, V, cfg->ban);
+    /* Honor the harness stop set (in addition to the engine's own eos).
+     * A stop is a normal control signal, not an error: return *token_id = -1
+     * with success. The caller owns logits and frees it in every case. */
+    for (size_t i = 0; i < cfg->n_stop_tokens; i++)
+        if (cfg->stop_tokens[i] == next) { next = -1; break; }
+    *token_id = next;
+    return 0;
+}
+
+static int glm_engine_kv_get_len(void *engine_impl, int *len,
+                                 char *error, size_t error_size) {
+    ColiEngineRef *engine = (ColiEngineRef *)engine_impl;
+    if (!len)
+        return glm_engine_error(error, error_size, "invalid kv_get_len request");
+    *len = engine->pos;
+    return 0;
+}
+
+static int glm_engine_kv_rollback(void *engine_impl, int target_len,
+                                  char *error, size_t error_size) {
+    ColiEngineRef *engine = (ColiEngineRef *)engine_impl;
+    if (target_len < 0 || target_len > engine->pos)
+        return glm_engine_error(error, error_size, "invalid kv_rollback target");
+    /* Position-addressed KV: rewinding the cursor is O(1). The next prefill
+     * at target_len overwrites the stale rows (no recompute of a prefix). */
+    engine->pos = target_len;
+    return 0;
+}
+
+static const ColiEngineAdapter glm_engine_adapter = {
+    sizeof(ColiEngineAdapter), COLI_ENGINE_ABI_VERSION, "glm",
+    glm_engine_open, glm_engine_destroy,
+    glm_engine_tokenize, glm_engine_detokenize,
+    glm_engine_prefill, glm_engine_decode_step, glm_engine_sample,
+    glm_engine_kv_get_len, glm_engine_kv_rollback, {0}
+};
+
+int coli_glm_engine_adapter_register(void) {
+    return coli_engine_adapter_register(&glm_engine_adapter);
+}
+
+/* Auto-register on load so the backend is usable via dlopen without an explicit
+ * call. The normal `colibri` binary is built without COLI_ENGINE_ADAPTER, so
+ * this constructor never fires there. */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((constructor))
+static void glm_engine_adapter_ctor(void) {
+    coli_engine_adapter_register(&glm_engine_adapter);
+}
+#endif
+#endif /* COLI_ENGINE_ADAPTER */

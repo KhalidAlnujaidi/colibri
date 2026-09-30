@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Colibrì — "hi" → "hey": The Languages in the Journey</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2330;
+    --border: #2d333b;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --py: #f0db4f;      /* Python yellow */
+    --c: #89cff0;       /* C blue */
+    --cpp: #f17f3f;     /* C++ orange */
+    --gpu: #3fb950;     /* CUDA/Metal green */
+    --accent: #58a6ff;
+    --mono: "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  header.hero {
+    border: 1px solid var(--border); border-radius: 12px;
+    background: linear-gradient(135deg, #161b22 0%, #1c2330 100%);
+    padding: 28px 32px; margin-bottom: 20px; position: relative; overflow: hidden;
+  }
+  header.hero::after {
+    content: ""; position: absolute; top: -40%; right: -10%;
+    width: 380px; height: 380px;
+    background: radial-gradient(circle, rgba(137,207,240,.16), transparent 70%);
+    pointer-events: none;
+  }
+  header.hero h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -.5px; }
+  header.hero h1 .hi { color: var(--py); }
+  header.hero h1 .arrow { color: var(--muted); }
+  header.hero h1 .hey { color: var(--c); }
+  header.hero p { margin: 0; color: var(--muted); max-width: 680px; }
+
+  .answer {
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    border: 1px solid var(--border); border-radius: 12px;
+    background: var(--panel); padding: 18px 22px; margin: 20px 0 8px;
+  }
+  .answer .big {
+    font-size: 30px; font-weight: 700; font-family: var(--mono);
+    padding: 4px 14px; border-radius: 8px;
+  }
+  .big.py { color: #0d1117; background: var(--py); }
+  .big.c { color: #0d1117; background: var(--c); }
+  .answer .note { color: var(--muted); font-size: 14px; }
+
+  h2.section {
+    font-size: 18px; margin: 44px 0 6px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2.section .num {
+    background: var(--accent); color: #0d1117; width: 26px; height: 26px;
+    border-radius: 7px; display: inline-flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-weight: 700; font-size: 14px;
+  }
+  h2.section .sub { font-weight: 400; color: var(--muted); font-size: 13px; }
+
+  .diagram-wrap {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px; overflow-x: auto; margin: 12px 0 8px;
+  }
+  pre.diagram {
+    margin: 0; font-family: var(--mono); font-size: 13.5px; line-height: 1.4;
+    white-space: pre; color: var(--text);
+  }
+  .caption { font-size: 13px; color: var(--muted); margin: 4px 0 20px; padding-left: 2px; }
+  .caption code { font-family: var(--mono); color: var(--accent); font-size: 12px; }
+
+  /* language colors */
+  .py { color: var(--py); }
+  .c { color: var(--c); }
+  .cpp { color: var(--cpp); }
+  .gpu { color: var(--gpu); }
+  .m { color: var(--muted); }
+  .box-py { border: 1px solid #5c5a2e; }
+  .box-c { border: 1px solid #2e5c74; }
+  .box-cpp { border: 1px solid #6b4a2a; }
+  .box-gpu { border: 1px solid #2e5c44; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 16px; font-size: 12.5px; font-family: var(--mono); margin: 8px 0 18px; color: var(--muted); }
+  .legend span i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin: 16px 0 8px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+  .card h3 { margin: 0 0 8px; font-size: 14px; }
+  .card h3 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
+  .card p { margin: 0; font-size: 13px; color: var(--muted); }
+  .card p code { font-family: var(--mono); font-size: 12px; color: var(--text); }
+
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; text-align: center; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1><span class="hi">"hi"</span> <span class="arrow">→</span> <span class="hey">"hey"</span> — the languages in the journey</h1>
+    <p>Exactly two languages run on the live path for this one turn: <b style="color:#f0db4f">Python</b> (frontend/gateway) and <b style="color:#89cff0">C</b> (the engine). Everything else is build glue or an optional dashboard.</p>
+  </header>
+
+  <div class="answer">
+    <div class="big py">Python</div>
+    <span style="color:var(--muted)">sends it</span>
+    <div class="big c">C</div>
+    <span style="color:var(--muted)">thinks it</span>
+    <div class="big py">Python</div>
+    <span style="color:var(--muted)">streams it back</span>
+  </div>
+
+  <!-- ================= THE JOURNEY ================= -->
+  <h2 class="section"><span class="num">1</span>The "hi" → "hey" journey, language by step</h2>
+
+  <div class="diagram-wrap"><pre class="diagram">   you type <span class="py">"hi"</span>
+      │
+      ▼
+ <span class="py">┌─────────────────────────────── PYTHON ────────────────────────────────┐</span>
+ <span class="py">│ c/coli (CLI)                                                         │</span>
+ <span class="py">│   · reads your keystroke, resolves the model, sets env vars          │</span>
+ <span class="py">│   · spawns the engine process (C binary)                             │</span>
+ <span class="py">│                                                                    │</span>
+ <span class="py">│ c/openai_server.py  (in the `coli serve` / `coli chat` path)        │</span>
+ <span class="py">│   · render_chat_*():  wraps "hi" with the model's chat template     │</span>
+ <span class="py">│     e.g.  "&lt;|user|&gt;\nhi\n&lt;|end|&gt;\n&lt;|assistant|&gt;"                 │</span>
+ <span class="py">│   · SUBMIT frame: prompt string + byte count + temp/top-p           │</span>
+ <span class="py">└───────────────────────────────┬──────────────────────────────────────┘</span>
+                                  │  pipes: SUBMIT &lt;id&gt; &lt;slot&gt; &lt;bytes&gt; &lt;max&gt; &lt;t&gt; &lt;p&gt;
+                                  ▼
+ <span class="c">┌──────────────────────────────── C  ─────────────────────────────────┐</span>
+ <span class="c">│ THE ENGINE  (c/colibri.c, c/qwen36.c, c/glm53.c …)                 │</span>
+ <span class="c">│   · tok.h  (C)      BPE-tokenize "hi"   → id e.g. [11758]        │</span>
+ <span class="c">│   · step() (C)      embed → layers → lm_head → logits over vocab │</span>
+ <span class="c">│   · sample.h (C)    pick_tok() → next id (e.g. 3189 → "hey")      │</span>
+ <span class="c">│   · stream_token()  id → UTF-8 bytes → DATA &lt;id&gt; &lt;n&gt;\n hey\n      │</span>
+ <span class="c">└───────────────────────────────┬──────────────────────────────────────┘</span>
+                                  │  DATA frame with the decoded text "hey"
+                                  ▼
+ <span class="py">┌─────────────────────────────── PYTHON ───────────────────────────────┐</span>
+ <span class="py">│ c/openai_server.py                                                  │</span>
+ <span class="py">│   · reads the DATA frame, re-assembles UTF-8 bytes                 │</span>
+ <span class="py">│   · wraps as SSE  data: {"delta":{"content":"hey"}}                │</span>
+ <span class="py">│   · StopFilter checks for stop tokens                              │</span>
+ <span class="py">└───────────────────────────────┬──────────────────────────────────────┘</span>
+                                  ▼
+   you see <span class="c">"hey"</span></pre></div>
+  <p class="caption">The process boundary between the two languages is the pipe: <b style="color:#f0db4f">Python</b> writes framed lines on stdin, <b style="color:#89cff0">C</b> answers with framed lines on stdout.</p>
+
+  <!-- ================= STEP TABLE ================= -->
+  <h2 class="section"><span class="num">2</span>Which language runs where</h2>
+
+  <div class="diagram-wrap"><pre class="diagram"><span class="m">STEP                        LANGUAGE      FILE</span>
+────────────────────────────────────────────────────────────
+CLI: read "hi", launch       <span class="py">Python</span>        c/coli
+Prompt rendering + HTTP/SSE   <span class="py">Python</span>        c/openai_server.py
+Tokenize "hi" → ids          <span class="c">C</span>           c/tok.h
+Forward pass → logits        <span class="c">C</span>           c/&lt;family&gt;.c  (step / layers_forward / lm_head)
+Sample next id ("hey")       <span class="c">C</span>           c/sample.h  (pick_tok)
+Decode id → bytes            <span class="c">C</span>           c/tok.h / c/qwen36.c (stream_token)
+Wire protocol frames         <span class="c">C</span> → <span class="py">Python</span>   engine stdout → openai_server.py
+Stream to client             <span class="py">Python</span>        c/openai_server.py</pre></div>
+
+  <!-- ================= WHAT IS NOT INVOLVED ================= -->
+  <h2 class="section"><span class="num">3</span>What does <i>not</i> run for this turn</h2>
+
+  <div class="diagram-wrap"><pre class="diagram"> <span class="cpp">C++ / CUDA / Metal / Vulkan</span>   <span class="m">only when a GPU backend is compiled in —</span>
+                                <span class="m">not on a CPU-only build, and never changes</span>
+                                <span class="m">the "hi" → "hey" logic.</span>
+
+ <span class="gpu">Bash / .cmd / .ps1 scripts</span>   <span class="m">build + install glue only (setup.sh, warmup.ps1, …)</span>
+
+ <span class="m">TypeScript / Svelte / HTML</span>   <span class="m">optional web/ dashboard (Brio, Brain) — not needed</span>
+                                <span class="m">for a plain text exchange.</span></pre></div>
+
+  <h2 class="section"><span class="num">4</span>The one-line answer</h2>
+  <div class="diagram-wrap"><pre class="diagram">   <span class="py">Python (frontend / gateway)</span>  →  <span class="c">C (tokenizer + forward + sampler)</span>  →  <span class="py">Python (SSE back to you)</span></pre></div>
+
+  <div class="legend">
+    <span><i style="background:#f0db4f"></i>Python — frontend, gateway, HTTP/SSE</span>
+    <span><i style="background:#89cff0"></i>C — tokenizer, forward pass, sampler</span>
+    <span><i style="background:#f17f3f"></i>C++/CUDA — GPU-only, not on this path</span>
+    <span><i style="background:#3fb950"></i>Build scripts / web — optional</span>
+  </div>
+
+  <footer>Visual companion — mirrors the live <code>"hi"</code> → <code>"hey"</code> path through <code>colibri</code>. Pair with <code>architecture-visual.html</code> for the full pipeline.</footer>
+
+</div>
+</body>
+</html>

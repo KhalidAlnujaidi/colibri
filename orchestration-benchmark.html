@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Colibrì — Orchestration-Layer Benchmark: C vs C++ vs Python (scaled)</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2330;
+    --border: #2d333b;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --py: #f0db4f;      /* Python yellow */
+    --c: #89cff0;       /* C blue */
+    --cpp: #f17f3f;     /* C++ orange */
+    --accent: #58a6ff;
+    --good: #3fb950;
+    --mono: "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  header.hero {
+    border: 1px solid var(--border); border-radius: 12px;
+    background: linear-gradient(135deg, #161b22 0%, #1c2330 100%);
+    padding: 28px 32px; margin-bottom: 20px; position: relative; overflow: hidden;
+  }
+  header.hero::after {
+    content: ""; position: absolute; top: -40%; right: -10%;
+    width: 380px; height: 380px;
+    background: radial-gradient(circle, rgba(88,166,255,.14), transparent 70%);
+    pointer-events: none;
+  }
+  header.hero h1 { margin: 0 0 6px; font-size: 24px; letter-spacing: -.5px; }
+  header.hero h1 .c { color: var(--c); }
+  header.hero h1 .cpp { color: var(--cpp); }
+  header.hero h1 .py { color: var(--py); }
+  header.hero h1 .vs { color: var(--muted); }
+  header.hero p { margin: 0; color: var(--muted); max-width: 760px; }
+  header.hero p code { font-family: var(--mono); color: var(--accent); font-size: 12.5px; }
+
+  .kpis {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px; margin: 20px 0 8px;
+  }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px 18px; }
+  .kpi .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px; }
+  .kpi .value { font-size: 27px; font-weight: 700; font-family: var(--mono); margin: 4px 0 2px; }
+  .kpi .value .x { font-size: 15px; color: var(--muted); }
+  .kpi .sub { font-size: 12px; color: var(--muted); }
+
+  h2.section {
+    font-size: 18px; margin: 44px 0 6px; padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2.section .num {
+    background: var(--accent); color: #0d1117; width: 26px; height: 26px;
+    border-radius: 7px; display: inline-flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-weight: 700; font-size: 14px;
+  }
+  h2.section .sub { font-weight: 400; color: var(--muted); font-size: 13px; }
+
+  .tbl-scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; margin: 14px 0 6px; font-size: 13.5px; min-width: 620px; }
+  th, td { text-align: right; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .4px; }
+  td .lang { font-weight: 700; font-family: var(--mono); }
+  td.mono, td.ratio { font-family: var(--mono); }
+  .c { color: var(--c); }
+  .cpp { color: var(--cpp); }
+  .py { color: var(--py); }
+  .good { color: var(--good); }
+  .m { color: var(--muted); }
+  tr.best { background: rgba(63,185,80,.08); }
+  .ratio { font-family: var(--mono); font-weight: 600; }
+  .besttag { font-size: 10.5px; color: var(--good); font-family: var(--mono); }
+  .grp { background: var(--panel-2); font-weight: 700; font-family: var(--mono); font-size: 12.5px; color: var(--accent); }
+  .grp td { border-top: 1px solid var(--border); }
+
+  .note {
+    background: var(--panel); border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 14px 18px; margin: 16px 0; font-size: 13px; color: var(--muted);
+  }
+  .note b { color: var(--text); }
+  .note code { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+
+  footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; text-align: center; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1><span class="c">C</span> <span class="vs">vs</span> <span class="cpp">C++</span> <span class="vs">vs</span> <span class="py">Python</span> — orchestration-layer benchmark, scaled 1 → 64,000 tokens</h1>
+    <p>Stage 1 (spawn the engine) + stage 2 (render prompt, write <code>SUBMIT</code>) + stage 3 (read N <code>DATA</code>/<code>DONE</code> frames + stream bytes), timed against the <b>identical C <code>stub_engine</code></b> across five token counts so the per-frame scaling behavior is visible. iters scale down (5000→5) as tokens grow to bound wall time.</p>
+  </header>
+
+  <div class="kpis">
+    <div class="kpi">
+      <div class="label">Best speedup (median)</div>
+      <div class="value cpp">1.52<span class="x">×</span></div>
+      <div class="sub">C++ @ 64 tokens/req vs Python</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Speedup plateau</div>
+      <div class="value c">1.4<span class="x">–</span>1.5<span class="x">×</span></div>
+      <div class="sub">across all token counts</div>
+    </div>
+    <div class="kpi">
+      <div class="label">Per-token frame cost</div>
+      <div class="value">C 0.70 <span class="x">·</span> Py 0.99 <span class="x">µs</span></div>
+      <div class="sub">steady-state, marginal per DATA frame</div>
+    </div>
+  </div>
+
+  <!-- ============ FULL RESULTS ============ -->
+  <h2 class="section"><span class="num">1</span>Full results — median µs/req and req/s</h2>
+
+  <div class="tbl-scroll">
+  <table>
+    <thead><tr><th>tokens/req</th><th>Orchestrator</th><th>mean µs</th><th>median µs</th><th>req/s</th><th>speedup (median)</th></tr></thead>
+    <tbody>
+      <tr class="grp"><td colspan="6">tokens/req = 1 · iters 5000</td></tr>
+      <tr><td rowspan="3">1</td>
+        <td><span class="lang c">C</span></td><td class="mono">11.3</td><td class="mono">10.0</td><td class="mono">100,000</td><td class="ratio good">1.22×</td></tr>
+      <tr><td><span class="lang cpp">C++</span></td><td class="mono">11.2</td><td class="mono">9.8</td><td class="mono">102,564</td><td class="ratio good">1.24× <span class="besttag">best</span></td></tr>
+      <tr><td><span class="lang py">Python</span></td><td class="mono">13.7</td><td class="mono">12.2</td><td class="mono">81,914</td><td class="ratio m">1.00× baseline</td></tr>
+
+      <tr class="grp"><td colspan="6">tokens/req = 64 · iters 5000</td></tr>
+      <tr><td rowspan="3">64</td>
+        <td><span class="lang c">C</span></td><td class="mono">55.6</td><td class="mono">53.0</td><td class="mono">18,868</td><td class="ratio good">1.53× <span class="besttag">best</span></td></tr>
+      <tr><td><span class="lang cpp">C++</span></td><td class="mono">56.0</td><td class="mono">53.5</td><td class="mono">18,677</td><td class="ratio good">1.52×</td></tr>
+      <tr><td><span class="lang py">Python</span></td><td class="mono">82.2</td><td class="mono">81.1</td><td class="mono">12,333</td><td class="ratio m">1.00× baseline</td></tr>
+
+      <tr class="grp"><td colspan="6">tokens/req = 640 · iters 500</td></tr>
+      <tr><td rowspan="3">640</td>
+        <td><span class="lang c">C</span></td><td class="mono">486.1</td><td class="mono">485.0</td><td class="mono">2,062</td><td class="ratio good">1.39×</td></tr>
+      <tr><td><span class="lang cpp">C++</span></td><td class="mono">468.5</td><td class="mono">462.2</td><td class="mono">2,163</td><td class="ratio good">1.46× <span class="besttag">best</span></td></tr>
+      <tr><td><span class="lang py">Python</span></td><td class="mono">677.6</td><td class="mono">675.3</td><td class="mono">1,481</td><td class="ratio m">1.00× baseline</td></tr>
+
+      <tr class="grp"><td colspan="6">tokens/req = 6400 · iters 50</td></tr>
+      <tr><td rowspan="3">6400</td>
+        <td><span class="lang c">C</span></td><td class="mono">4,607.5</td><td class="mono">4,599</td><td class="mono">217</td><td class="ratio good">1.38×</td></tr>
+      <tr><td><span class="lang cpp">C++</span></td><td class="mono">4,388.7</td><td class="mono">4,394</td><td class="mono">228</td><td class="ratio good">1.45× <span class="besttag">best</span></td></tr>
+      <tr><td><span class="lang py">Python</span></td><td class="mono">6,352.5</td><td class="mono">6,353</td><td class="mono">157</td><td class="ratio m">1.00× baseline</td></tr>
+
+      <tr class="grp"><td colspan="6">tokens/req = 64000 · iters 5–10</td></tr>
+      <tr><td rowspan="3">64000</td>
+        <td><span class="lang c">C</span></td><td class="mono">44,807</td><td class="mono">44,772</td><td class="mono">22.3</td><td class="ratio good">1.41× <span class="besttag">best</span></td></tr>
+      <tr><td><span class="lang cpp">C++</span></td><td class="mono">45,193</td><td class="mono">45,538</td><td class="mono">22.0</td><td class="ratio good">1.39×</td></tr>
+      <tr><td><span class="lang py">Python</span></td><td class="mono">63,119</td><td class="mono">63,122</td><td class="mono">15.8</td><td class="ratio m">1.00× baseline</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <!-- ============ SCALING ============ -->
+  <h2 class="section"><span class="num">2</span>Scaling — the plateau</h2>
+
+  <div class="note">
+    The speedup does <b>not</b> keep growing with token count — it plateaus at ~1.4–1.5×.
+    That is exactly what you'd expect when the win is a <b>constant per-frame cost</b>, not a
+    growing one: C/C++ sit ~0.70 µs per <code>DATA</code> frame vs Python ~0.99 µs, and that
+    fixed per-token ratio is what the aggregate speedup converges to. There is no superlinear
+    blow-up in Python's frame loop to exploit at scale.
+  </div>
+
+  <div class="tbl-scroll">
+  <table>
+    <thead><tr><th>Segment</th><th>Δ tokens</th><th class="c">C µs/token</th><th class="cpp">C++ µs/token</th><th class="py">Python µs/token</th><th>Py / C++</th></tr></thead>
+    <tbody>
+      <tr><td>64 → 640</td><td class="mono">576</td><td class="mono">0.75</td><td class="mono">0.71</td><td class="mono">1.03</td><td class="ratio good">1.45×</td></tr>
+      <tr><td>640 → 6400</td><td class="mono">5,760</td><td class="mono">0.71</td><td class="mono">0.68</td><td class="mono">0.99</td><td class="ratio good">1.44×</td></tr>
+      <tr><td>6400 → 64000</td><td class="mono">57,600</td><td class="mono">0.70</td><td class="mono">0.71</td><td class="mono">0.99</td><td class="ratio good">1.38×</td></tr>
+      <tr class="best"><td><b>steady-state</b></td><td class="mono">—</td><td class="mono"><b>0.70</b></td><td class="mono"><b>0.70</b></td><td class="mono"><b>0.99</b></td><td class="ratio good"><b>1.41×</b></td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p class="m" style="font-size:12.5px; color:var(--muted)">Marginal per-token cost = (median at hi − median at lo) / (Δ tokens), which removes the fixed per-request cost (spawn/render/header/DONE).</p>
+
+  <!-- ============ ABSOLUTE ============ -->
+  <h2 class="section"><span class="num">3</span>Absolute glue cost stays small</h2>
+
+  <div class="note">
+    Even at <b>64,000 tokens/req</b>, the entire orchestration round-trip through
+    fork/exec pipes is only <b>~45 ms in C</b> and <b>~63 ms in Python</b> — the vast majority
+    of that is moving 192 KB of frame bytes across the pipe, which real inference would dwarf.
+    At 64,000 tokens the throughput difference is C 22.3 req/s vs Python 15.8 req/s
+    (C++ 22.0 req/s). The orchestration layer is not the bottleneck in absolute terms; the
+    wins compound as <i>capacity</i> at the gateway boundary under many concurrent turns.
+  </div>
+
+  <h2 class="section"><span class="num">4</span>Method</h2>
+  <div class="note">
+    <b>Isolating orchestration only.</b> All three drivers talk to the same compiled C
+    <code>stub_engine</code> (identical protocol: <code>READY</code>, then per request a
+    <code>SUBMIT &lt;id&gt; &lt;slot&gt; &lt;bytes&gt; &lt;max&gt; &lt;t&gt; &lt;p&gt;</code> header + prompt,
+    then N <code>DATA &lt;id&gt; &lt;n&gt;\n…\n</code> frames and a <code>DONE</code> line). One persistent
+    engine process is reused across iterations — the <code>coli serve</code> "service" regime.
+    <code>req/s = 1e6 / median</code>; warm-up run first. Token bytes are streamed to <code>/dev/null</code>
+    (as SSE would emit them) so tables stay readable. Build: <code>clang -O2</code> (C),
+    <code>clang++ -O2 -std=c++17</code> (C++), <code>python3</code>. At 64000 tokens the C/C++ drivers
+    clamp their minimum to 10 iters (requested 5); Python used 5 — both give stable medians.
+    macOS/arm64.
+  </div>
+
+  <footer>Colibrì orchestration-layer benchmark — <code>c/bench_orchestration/</code> · engine = identical <code>stub_engine</code> for every orchestrator · scaled iters · macOS/arm64, clang -O2.</footer>
+
+</div>
+</body>
+</html>

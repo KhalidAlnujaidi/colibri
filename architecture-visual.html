@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Colibrì — Prompt to Token: Architecture Visual</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2330;
+    --border: #2d333b;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --yellow: #d29922;
+    --purple: #bc8cff;
+    --red: #f85149;
+    --orange: #f0883e;
+    --mono: "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  header.hero {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: linear-gradient(135deg, #161b22 0%, #1c2330 100%);
+    padding: 28px 32px;
+    margin-bottom: 20px;
+    position: relative;
+    overflow: hidden;
+  }
+  header.hero::after {
+    content: "";
+    position: absolute;
+    top: -40%; right: -10%;
+    width: 380px; height: 380px;
+    background: radial-gradient(circle, rgba(88,166,255,.18), transparent 70%);
+    pointer-events: none;
+  }
+  header.hero h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -.5px; }
+  header.hero h1 .accent { color: var(--accent); }
+  header.hero p { margin: 0; color: var(--muted); max-width: 640px; }
+  header.hero .tags { margin-top: 14px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .tag {
+    font-size: 12px; font-family: var(--mono);
+    padding: 3px 10px; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted); background: #0d1117;
+  }
+  .tag.py { color: #f0db4f; border-color: #5c5a2e; }
+  .tag.c { color: #89cff0; border-color: #2e5c74; }
+  .tag.hw { color: var(--green); border-color: #2e5c44; }
+
+  .thesis {
+    border-left: 3px solid var(--accent);
+    background: var(--panel);
+    padding: 14px 18px;
+    border-radius: 0 8px 8px 0;
+    margin: 20px 0;
+    font-size: 15px;
+  }
+  .thesis b { color: var(--accent); }
+
+  h2.section {
+    font-size: 18px;
+    margin: 44px 0 6px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2.section .num {
+    background: var(--accent); color: #0d1117;
+    width: 26px; height: 26px; border-radius: 7px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-family: var(--mono); font-weight: 700; font-size: 14px;
+  }
+  h2.section .sub { font-weight: 400; color: var(--muted); font-size: 13px; }
+
+  .diagram-wrap {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px;
+    overflow-x: auto;
+    margin: 12px 0 8px;
+  }
+  pre.diagram {
+    margin: 0;
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.35;
+    white-space: pre;
+    color: var(--text);
+  }
+  .caption {
+    font-size: 13px; color: var(--muted); margin: 4px 0 20px;
+    padding-left: 2px;
+  }
+  .caption code { font-family: var(--mono); color: var(--accent); font-size: 12px; }
+
+  /* colorized token spans inside pre */
+  .k { color: var(--accent); }        /* keywords/paths */
+  .g { color: var(--green); }         /* green: success/hardware */
+  .y { color: var(--yellow); }        /* yellow: engine */
+  .p { color: var(--purple); }        /* purple: tier/cache */
+  .r { color: var(--red); }
+  .o { color: var(--orange); }
+  .m { color: var(--muted); }         /* comments */
+
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin: 16px 0 8px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 18px;
+  }
+  .card h3 { margin: 0 0 8px; font-size: 14px; }
+  .card h3 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 8px; vertical-align: 1px; }
+  .card p { margin: 0; font-size: 13px; color: var(--muted); }
+  .card p code { font-family: var(--mono); font-size: 12px; color: var(--text); }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); font-family: var(--mono); margin: 6px 0 18px; }
+  .legend span i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; }
+
+  footer {
+    margin-top: 48px; padding-top: 16px;
+    border-top: 1px solid var(--border);
+    color: var(--muted); font-size: 12px; text-align: center;
+  }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>Colibrì — <span class="accent">prompt → token</span></h1>
+    <p>How one keystroke becomes a streamed token: an ASCII architecture walkthrough of the repo, rendered as HTML.</p>
+    <div class="tags">
+      <span class="tag py">Python · orchestration</span>
+      <span class="tag c">C · inference engine</span>
+      <span class="tag hw">SSD → RAM → VRAM</span>
+    </div>
+  </header>
+
+  <div class="thesis">
+    <b>One-line thesis:</b> a Python <i>orchestration layer</i> (<code>c/coli</code>, <code>c/openai_server.py</code>)
+    renders prompts and speaks HTTP/frames; a pure-C <i>inference engine</i> (one <code>.c</code> file per model family)
+    does tokenizing, forward passes, sampling, and streams bytes back — while treating SSD → RAM → VRAM
+    as a single memory hierarchy.
+  </div>
+
+  <!-- ================= FIG 0 ================= -->
+  <h2 class="section"><span class="num">0</span>Static layout <span class="sub">which file owns which job</span></h2>
+
+  <div class="diagram-wrap"><pre class="diagram"><span class="k">colibri/ repo</span>
+│
+├── <span class="y">c/coli</span> <span class="m">───────── CLI / launcher (Python) ───────────────────────┐</span>
+│     <span class="m">· resolves model dir + family   (engine_for, resource_plan.py)  │</span>
+│     <span class="m">· builds env (RAM budget, SERVE flags)                        │</span>
+│     <span class="m">· spawns either the engine binary directly  OR  the HTTP gateway│</span>
+│                                                                       ▼
+├── <span class="y">c/openai_server.py</span> <span class="m">── OpenAI-compatible gateway (Python) ─── stdin/stdout frames</span>
+│     <span class="m">· /v1/chat/completions, SSE streaming            (mux protocol, SERVE_BATCH=1)</span>
+│     <span class="m">· CHAT RENDERERS: messages[] -> native prompt (render_chat_&lt;arch&gt;)</span>
+│     <span class="m">· owns stop filters / tool-call framing / images</span>
+│
+├── <span class="y">c/&lt;family&gt;.c</span> <span class="m">──────── THE ENGINE (C, one per family) ── c/colibri.c (GLM)</span>
+│     <span class="m">· glm53 / deepseek_v4 / kimi_k3 / qwen36 / qwen38 / olmoe / inkling / …</span>
+│     <span class="m">· same skeleton, different math: embed ▸ layers ▸ lm_head</span>
+│
+├── <span class="p">shared headers</span> <span class="m">(the reusable architecture) ──────────────────────────</span>
+│     <span class="k">tok.h</span>      <span class="m">BPE tokenizer (text ▸ id, id ▸ text)</span>
+│     <span class="k">sample.h</span>   <span class="m">temperature / top-p / stop set   (pick_tok, c/sample.h:100)</span>
+│     <span class="k">tier.h, expert_store.h</span>  <span class="m">VRAM/RAM/disk tiering + LFRU admission</span>
+│     <span class="k">kv_prefix.h, kv_fp8.h</span>   <span class="m">KV cache, prefix reuse, fp8/polar variants</span>
+│     <span class="k">grammar.h, schema_gbnf.h</span> <span class="m">constrained decoding</span>
+│     <span class="m">plus: PILOT prefetch thread, decode_batch, spec decode (MTP)</span>
+│
+└── <span class="o">backends</span>: <span class="m">SIMD C (default) · backend_cuda*.cu · backend_metal.mm · backend_vulkan.c</span></pre></div>
+  <p class="caption"><b>Basis:</b> <i>one prototype, many thin implementations.</i> All families reuse <code>tok.h</code>/<code>sample.h</code>/<code>tier.h</code> (header-only libs), so the prompt→token pipeline is written once per repo, not once per model.</p>
+
+  <!-- ================= FIG 1 ================= -->
+  <h2 class="section"><span class="num">1</span>The end-to-end journey <span class="sub">one prompt → streamed tokens</span></h2>
+
+  <div class="diagram-wrap"><pre class="diagram"><span class="k">┌─ terminal ─┐</span>   <span class="k">┌─ HTTP client ─┐</span>   <span class="k">┌─ web/desktop ─┐</span>
+<span class="k">│ $ coli chat │</span>   <span class="k">│ curl /v1/...  │</span>   <span class="k">│  Brio, Brain  │</span>
+<span class="k">└──────┬──────┘</span>   <span class="k">└──────┬────────┘</span>   <span class="k">└──────┬────────┘</span>
+       │                 │                   │
+       └────────┬────────┴───────────────────┤
+                ▼                           ▼
+       <span class="y">┌──────────────────┐</span>        <span class="y">┌────────────────────┐</span>
+       <span class="y">│ c/coli (Python)  │</span> spawn  <span class="y">│ openai_server.py   │</span><span class="r">◀──</span> 4. converts reply to
+       <span class="y">│                  │</span>──────▶<span class="y">│   gateway (:8000)  │</span>    SSE chunk / JSON
+       <span class="y">│ build env:       │</span>        <span class="y">│                    │</span>
+       <span class="y">│  SERVE=1  (chat) │</span>        <span class="y">│ 1. render_chat():  │</span>
+       <span class="y">│  SERVE_BATCH=1   │</span>        <span class="y">│    messages[] ──▶  │</span>
+       <span class="y">└──────────────────┘</span>        <span class="y">│    flat UTF-8      │</span><span class="r">◀──</span> 3. engine frames
+                                   <span class="y">│    prompt string   │</span>    DATA/DONE/ERROR
+                                   <span class="y">│ 2. SUBMIT frame ───┼──[ stdin ]</span>
+                                   <span class="y">└─────────┬──────────┘</span>
+                                             │ pipes (line protocol)
+                                             ▼
+       <span class="p">┌────────────────────── THE ENGINE (C process) ──────────────────────┐</span>
+       <span class="p">│                            [ stdout ]                             │</span>
+       <span class="p">│   5. READY / HWINFO / TIERS / EMAP  ← handshake (telemetry)        │</span>
+       <span class="p">│   6. SUBMIT: tok.h encodes prompt ──▶ ids[]                       │</span>
+       <span class="p">│   7. PREFILL: forward over all prompt ids (parallel fill KV)       │</span>
+       <span class="p">│   8. DECODE loop: pick ─▶ forward(1 id) ─▶ pick …                  │</span>
+       <span class="p">│   9. each sample: DATA &lt;id&gt; &lt;n&gt;\n&lt;utf-8&gt;\n per token              │</span>
+       <span class="p">│  10. DONE &lt;id&gt; STAT &lt;tokens&gt; &lt;tok_s&gt; &lt;hit_pct&gt; …                 │</span>
+       <span class="p">└────────────────────────────────────────────────────────────────────┘</span>
+                                             │
+                                             ▼
+       <span class="g">model weights (mmap'd shards) ◀──▶ compute (SIMD/CUDA/Metal/Vulkan)</span>
+       <span class="g">disk ▸ RAM ▸ VRAM  (one hierarchy — see FIG 4)</span></pre></div>
+  <p class="caption"><b>Basis:</b> <i>the process boundary is the API boundary.</i> Engines never parse JSON — they receive byte-counted lines and emit byte-counted frames (<code>docs/serve_protocol.md</code>), so any front-end can replace any other.</p>
+
+  <!-- ================= FIG 2 ================= -->
+  <h2 class="section"><span class="num">2</span>Inside one turn <span class="sub">prefill vs decode</span></h2>
+
+  <div class="diagram-wrap"><pre class="diagram"> prompt ids:  [ciao , !]             n_new = 3
+              │
+              ▼
+  <span class="k">┌──────────────────── PREFILL  (S = prompt length) ────────────────────┐</span>
+  <span class="k">│  embed(ids) ▸ [ layer ] ▸ [ layer ] ▸ … ▸ lm_head                    │</span>
+  <span class="k">│  fills the KV cache for every prompt position at once                │</span>
+  <span class="k">│  costs O(S · layers) once, hides first-token latency    c/qwen36.c:2900</span>
+  <span class="k">└────────────────────────────────┬─────────────────────────────────────┘</span>
+                                    │ logits for position p
+                                    ▼
+        DECIDE ── <span class="g">pick_tok()</span>:  temp&lt;=0 → argmax, else top-p sample   <span class="m">c/sample.h:100</span>
+                                    │ id = 763
+                    ┌───────────────▼────────────────┐
+  token 1 = "Ciao" │  <span class="g">stream_token(id)</span> ▸ bytes      │──▶ client (SSE DELTA)
+                    └───────────────┬────────────────┘
+                                    │ feed last id only (S = 1)
+                                    ▼
+             <span class="y">┌──────────────── DECODE  (one token per step) ───────────────┼─</span>
+             <span class="y">│  embed(1) ▸ layers_forward ▸ lm_head ▸ pick_tok             │</span>
+             <span class="y">│  KV cache grows by 1 position; attention reads it back       │</span>
+             <span class="y">│  repeat until: stop token | max_tokens | ESC                │</span>
+             <span class="y">└───────────────────────────────────────────────────────────────┘</span>
+
+  compare:   <span class="m"># two hardware personalities in one loop</span>
+  prompt  <span class="g">▲██████████████████░░</span>  <span class="m">(wide matrix multiplies → compute-bound)</span>
+  decode  <span class="o">░ ▓ ░ ▓ ░ ▓ ░ ▓ ░ ▓</span>  <span class="m">(skinny spikes → memory-bandwidth-bound)</span></pre></div>
+  <p class="caption"><b>Basis:</b> prefill is math-bound, decode is bandwidth-bound. Every feature (KV prefix reuse, expert prefetch, batched slots) exists to hide the decode spikes behind I/O.</p>
+
+  <!-- ================= FIG 3 ================= -->
+  <h2 class="section"><span class="num">3</span>One layer <span class="sub">the real math, automation removed</span></h2>
+
+  <div class="diagram-wrap"><pre class="diagram">                <span class="g">x</span>  (hidden vector of the current token)
+                │
+       <span class="k">┌────────▼─────────┐</span>
+       <span class="k">│ + ── RMSNorm      │</span>
+       <span class="k">├──────────────────┤</span>
+       <span class="k">│ ATTENTION family │</span>  <span class="m">glm: MLA (q/kv-LoRA)   qwen36: DeltaNet +</span>
+       <span class="k">│ scopes the past: │</span>  <span class="m">dsv4: sparse indexer   classic window attention</span>
+       <span class="k">│ keys ▸ values    │</span>  <span class="m">(glm53 DSA)             + recurrent state</span>
+       <span class="k">│ into KV ◄────────┼── kv_prefix.h / kv_fp8.h (prefix reuse, quant)</span>
+       <span class="k">└────────┬─────────┘</span>
+                ▼  residual add
+       <span class="k">┌────────▼─────────┐</span>
+       <span class="k">│      RMSNorm      │</span>
+       <span class="k">├──────────────────┤</span>
+       <span class="k">│  ROUTER (GLU)     │</span>  <span class="m">logits over E experts (e.g. 256), sigmoid + bias</span>
+       <span class="k">└────────┬─────────┘</span>
+                │ top-k = 8 winners
+       <span class="p">┌────────▼────────── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐</span>
+       <span class="p">│  for each winner: fetch gate/up/down views  │◀── FIG 4 (tier cache)</span>
+       <span class="p">│  int4/int8 matmul ▸ sum(weight_i * E_i)    │</span>
+       <span class="p">│  + shared expert (always resident)          │</span>
+       <span class="p">└────────┬────────── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘</span>
+                ▼ residual add ──▶ next layer (×N layers)
+  <span class="m">…───────────────────────────────────────────────…</span>
+       <span class="o">final RMSNorm ▸ lm_head ▸ logits[vocab] ▸ pick_tok ▸ id</span></pre></div>
+  <p class="caption"><b>Basis:</b> only <code>top-k</code> experts are computed per token (~% of a 744B model activates), and <i>only they</i> must live in fast memory — which is why the storage layer is the heart of this repo.</p>
+
+  <!-- ================= FIG 4 ================= -->
+  <h2 class="section"><span class="num">4</span>The multitier expert store <span class="sub">the repo's core invention</span></h2>
+
+  <div class="diagram-wrap"><pre class="diagram">   routed (layer 17, expert 178)
+        │
+        ▼
+ <span class="k">┌──────────────── hit? ────────────────┐</span>
+ <span class="g">│   VRAM hot store  ─── residency 2 ───┼──▶ run in place   (0 µs) </span>
+ <span class="g">│   RAM  cache      ─── residency 1 ───┼──▶ memcpy up      (~µs) </span>
+ <span class="o">│   disk shard      ─── residency 0 ───┼──▶ read_int4 file (~ms) </span>
+ <span class="k">└───────────────────────┬───────────────┘</span>
+                         │ miss
+        <span class="p">PILOT prefetch thread predicts L+1 layer's route</span>
+        <span class="p">and stages it from disk WHILE Layer L computes</span>
+                         │
+                         ▼
+        <span class="y">tier admission (tier.h): hot/cold heat comparison,</span>
+        <span class="y">LFRU score (freq&lt;&lt;8 | recency) → promote/evict, no ping-pong</span>
+                         │
+        <span class="m">telemetry emitted live:  EMAP (tier+heat byte/expert)</span>
+        <span class="m">                         HITS (who routed) / REPIN (swap events)</span>
+        <span class="m">                         ▸ feeds the "Brain" &amp; Profiling dashboards</span></pre></div>
+
+  <div class="diagram-wrap"><pre class="diagram">  a 744B model, resident ~9.9 GB ── the trick, in one line:
+
+  <span class="g">.safetensors ──int4/int8 row+scales──▶ mmap ▸ experts streamed per-hit ▸</span>
+  <span class="g">top-k only ▸ router never changes semantics</span>
+  <span class="m">("insufficient fast memory may reduce speed; it must not quietly redefine the model")</span></pre></div>
+  <p class="caption"><b>Basis:</b> a <i>cache with a scheduler</i> — storage/RAM/VRAM admit experts by measured routing heat, with a background pilot turning disk latency into overlapped work.</p>
+
+  <!-- ================= FIG 5 ================= -->
+  <h2 class="section"><span class="num">5</span>Serve wire exchange <span class="sub">mux protocol, <code>coli serve</code></span></h2>
+
+  <div class="diagram-wrap"><pre class="diagram"> server                                   engine  (c/colibri.c:9417 run_serve_mux)
+   │  ──▶ <span class="g">READY</span> ◀── READY sentinel handshake            │
+   │  ◀── <span class="m">HWINFO / TIERS / EMAP</span> ── telemetry           │
+   │  ──▶ <span class="y">SUBMIT &lt;id&gt; &lt;slot&gt; &lt;bytes&gt; &lt;max&gt; &lt;t&gt; &lt;p&gt;</span>      │
+   │       &lt;bytes of rendered prompt&gt;                   │
+   │                                                    ▼
+   │                        <span class="m">prefix-match slot KV (truncate-extend reuse)</span>
+   │                        <span class="m">PREFILL serially ▸ DECODE continuously batched</span>
+   │                        <span class="m">(up to 16 slots, one row per forward)</span>
+   │  ◀── <span class="g">DATA &lt;id&gt; &lt;n&gt;  "\xC3\x80… "</span>   token text    │
+   │  ◀── <span class="g">DATA &lt;id&gt; &lt;n&gt;  " come stai?"</span>               │
+   │      (repeat × N)                                 │
+   │      <span class="m">middleware: UTF-8 assert, StopFilter, TOPK, entropy, PERF</span>
+   │  ◀── <span class="g">DONE &lt;id&gt; STAT &lt;toks&gt; &lt;tok_s&gt; &lt;hit%&gt; …</span>        │
+   ▼ <span class="r">HTTP: SSE `data: {delta}` … `data: [DONE]`</span></pre></div>
+  <p class="caption"><b>Basis:</b> stateless HTTP turns stay cached because the engine reuses the common KV prefix across <code>SUBMIT</code>s — truncate-and-extend.</p>
+
+  <!-- ================= STACK SUMMARY ================= -->
+  <h2 class="section"><span class="num">6</span>The stack, compressed</h2>
+
+  <div class="diagram-wrap"><pre class="diagram">  your keystroke
+      ▶ <span class="y">coli (Python)</span>        — plan, env, launch
+        ▶ <span class="y">openai_server.py</span>   — prompt rendering, HTTP, filters
+          ▶ <span class="p">serve loop + frame protocol</span>  — slots, batching, telemetry
+            ▶ <span class="k">tok.h ▸ step():</span>  embed ▸ layers ▸ lm_head    — the math
+              ▶ <span class="k">sample.h ▸ pick_tok()</span>                    — the choice
+                ▶ <span class="g">tier/expert_store + backends</span>          — the hardware
+      ◀── STREAM: bytes become text, token by token</pre></div>
+
+  <div class="legend">
+    <span><i style="background:#58a6ff"></i>Python / orchestration</span>
+    <span><i style="background:#d29922"></i>engine (C)</span>
+    <span><i style="background:#bc8cff"></i>tier / cache</span>
+    <span><i style="background:#3fb950"></i>hardware / success path</span>
+    <span><i style="background:#f0883e"></i>backends / output</span>
+    <span><i style="background:#8b949e"></i>comments / telemetry</span>
+  </div>
+
+  <div class="cards">
+    <div class="card">
+      <h3><span class="dot" style="background:#58a6ff"></span>Decides <i>what</i> to ask</h3>
+      <p><code>c/coli</code> + <code>c/openai_server.py</code>: model resolution, prompt rendering, HTTP, stop filters, tool framing.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot" style="background:#3fb950"></span>Decides <i>what the token is</i></h3>
+      <p><code>tok.h</code> → <code>step()</code> → <code>sample.h</code>: the forward pass and the sampler choose each id.</p>
+    </div>
+    <div class="card">
+      <h3><span class="dot" style="background:#bc8cff"></span>Decides <i>where weights live</i></h3>
+      <p><code>tier.h</code>/<code>expert_store.h</code> + SIMD/CUDA/Metal/Vulkan: get the routed experts into fast memory long enough to compute.</p>
+    </div>
+  </div>
+
+  <footer>
+    Visual companion to the <code>colibri</code> repo — generated from source (diagrams mirror <code>docs/serve_protocol.md</code> and the engine loops).
+  </footer>
+
+</div>
+</body>
+</html>

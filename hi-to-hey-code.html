@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Colibrì — "hi" → "hey": The Actual Code, Step by Step</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2330;
+    --border: #2d333b;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --py: #f0db4f;
+    --c: #89cff0;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --mono: "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.5; }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  header.hero {
+    border: 1px solid var(--border); border-radius: 12px;
+    background: linear-gradient(135deg,#161b22,#1c2330); padding: 26px 30px; margin-bottom: 18px;
+  }
+  header.hero h1 { margin: 0 0 6px; font-size: 24px; }
+  header.hero h1 .py { color: var(--py); } header.hero h1 .c { color: var(--c); }
+  header.hero p { margin: 0; color: var(--muted); max-width: 700px; }
+
+  h2.sec { font-size: 18px; margin: 40px 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+
+  .stage {
+    border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin: 18px 0;
+    background: var(--panel);
+  }
+  .stage .bar {
+    display: flex; align-items: center; gap: 10px; padding: 9px 16px;
+    font-family: var(--mono); font-size: 13px; font-weight: 600;
+  }
+  .bar .badge { font-size: 11px; padding: 2px 9px; border-radius: 999px; letter-spacing: .3px; }
+  .bar.py  { background: #2a2710; border-bottom: 1px solid #5c5a2e; color: var(--py); }
+  .bar.c   { background: #0f2733; border-bottom: 1px solid #2e5c74; color: var(--c); }
+  .bar.py  .badge { background: var(--py); color: #0d1117; }
+  .bar.c   .badge { background: var(--c); color: #0d1117; }
+  .bar .fn { color: var(--text); font-weight: 400; }
+  .bar .loc { margin-left: auto; color: var(--muted); font-weight: 400; font-size: 12px; }
+
+  .stage .body { padding: 14px 18px; }
+  .stage .body .why { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+
+  pre.code {
+    margin: 0; padding: 12px 14px; border-radius: 8px; background: #0a0e14;
+    border: 1px solid #21262d; font-family: var(--mono); font-size: 12.5px; line-height: 1.5;
+    overflow-x: auto; white-space: pre;
+  }
+  pre.code .cm { color: #6a737d; }
+  pre.code .kw { color: var(--accent); }
+  pre.code .str { color: #a5d6ff; }
+  pre.code .num { color: #f0883e; }
+  pre.code .pyk { color: var(--py); }
+  pre.code .ck { color: var(--c); }
+  pre.code .hl { background: rgba(88,166,255,.12); outline: 1px solid rgba(88,166,255,.25); border-radius: 3px; }
+  pre.code .g { color: var(--green); }
+
+  .pipe {
+    text-align: center; color: var(--muted); font-family: var(--mono); font-size: 13px;
+    padding: 6px 0;
+  }
+  .pipe .frame { color: var(--green); background: #0d2818; border: 1px solid #2e5c44; padding: 2px 10px; border-radius: 6px; font-size: 12px; }
+
+  .table-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 8px 4px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; }
+  td code { font-size: 12px; }
+  .py-c { color: var(--py); } .c-c { color: var(--c); }
+  tr:last-child td { border-bottom: none; }
+
+  footer { margin-top: 46px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; text-align: center; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1><span class="py">"hi"</span> → <span class="c">"hey"</span> — the <i>actual code</i> at each step</h1>
+    <p>Same pipeline as before, but now each stage shows the <b>real function that runs</b> (name + file + line), pulled from the source. <span style="color:#f0db4f">Python</span> orchestrates; <span style="color:#89cff0">C</span> computes.</p>
+  </header>
+
+  <!-- ============ STAGE 1 : Python CLI ============ -->
+  <div class="stage">
+    <div class="bar py"><span class="badge">PYTHON</span> <span class="fn">c/coli — CLI reads your keystroke &amp; launches the engine</span> <span class="loc">c/coli</span></div>
+    <div class="body">
+      <div class="why">The Python launcher resolves the model, builds the environment, and spawns the C engine as a child process with pipes for stdin/stdout.</div>
+      <pre class="code"><span class="cm"># chat path, non-GLM families → spawn the HTTP gateway, which owns the engine</span>
+cmd = [sys.executable, openai_server.__file__, "--model", a.model,
+       "--engine", engine, "--arch", arch, "--model-id", model_id,
+       "--host", "127.0.0.1", "--port", "8000", ...]
+p = subprocess.Popen(cmd, env=env_for_engine(a, arch))
+
+<span class="cm"># GLM chat path → spawn the engine binary directly with the legacy protocol</span>
+e = env_for(a); e[<span class="str">"SERVE"</span>] = <span class="str">"1"</span>
+p = subprocess.Popen([GLM, str(cap_for_launch(...))], env=e,
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, ...)
+st = <span class="pyk">stream_turn</span>(p, READY, _preamble.extend)   <span class="cm"># wait for READY handshake</span></pre>
+    </div>
+  </div>
+
+  <!-- ============ STAGE 2 : Python render + submit ============ -->
+  <div class="stage">
+    <div class="bar py"><span class="badge">PYTHON</span> <span class="fn">c/openai_server.py — render prompt, write SUBMIT frame</span> <span class="loc">c/openai_server.py:3652,3719,3743</span></div>
+    <div class="body">
+      <div class="why">The chat renderer wraps <code>"hi"</code> in the model's template, then the gateway writes one byte-counted <code>SUBMIT</code> line to the engine's stdin.</div>
+      <pre class="code">def <span class="pyk">generate</span>(self, prompt, max_tokens, temperature, top_p, on_text, ...):
+    payload = prompt.<span class="kw">encode</span>(<span class="str">"utf-8"</span>)
+    ...
+    header = (<span class="str">f"SUBMIT {request_id} {cache_slot} {len(payload)} {max_tokens} "</span>
+              <span class="str">f"{temperature} {top_p}"</span>)                    <span class="cm"># line 3719</span>
+    <span class="pyk">_write_all</span>(self.process.stdin, header + payload + <span class="str">b"\n"</span>, <span class="str">"SUBMIT"</span>)  <span class="cm"># line 3743</span></pre>
+    </div>
+  </div>
+
+  <div class="pipe">▼ &nbsp; engine stdin &nbsp; <span class="frame">SUBMIT 1 0 2 64 0.7 1.0\n&lt;|user|&gt;\nhi\n&lt;|end|&gt;\n&lt;|assistant|&gt;\n</span> &nbsp;▼</div>
+
+  <!-- ============ STAGE 3 : C tokenize ============ -->
+  <div class="stage">
+    <div class="bar c"><span class="badge">C</span> <span class="fn">tok.h / colibri.c — BPE-tokenize "hi" → ids</span> <span class="loc">c/colibri.c:9268 · c/qwen36.c:301</span></div>
+    <div class="body">
+      <div class="why">The engine reads exactly <code>bytes</code> of payload and runs the BPE encoder: special-token split → pre-tokenize → per-piece BPE merges → token ids.</div>
+      <pre class="code">nt = <span class="ck">tok_encode</span>(T, raw, (int)sub.bytes, tmp, maxctx-1);   <span class="cm">/* "hi" → [11758] */</span>
+<span class="cm">// inside tok_encode → encode_text (qwen36.c:301)</span>
+<span class="kw">static void</span> <span class="ck">encode_text</span>(<span class="kw">const char</span> *text, <span class="kw">int</span> **out_ids, <span class="kw">int</span> *out_n){
+    <span class="kw">while</span>(i &lt; tlen){
+        <span class="kw">int</span> sid; <span class="kw">int</span> L = <span class="ck">try_special</span>(text,i,tlen,&amp;sid);
+        <span class="kw">if</span>(L&gt;<span class="num">0</span>){ <span class="ck">push_id</span>(&amp;ids,&amp;n,&amp;cap,sid); i+=L; <span class="kw">continue</span>; }
+        ...
+        <span class="ck">bpe_piece</span>(text+i, j-i, &amp;ids, &amp;n, &amp;cap);      <span class="cm">/* BPE merge → id */</span>
+    }
+}
+printf(<span class="str">"ACCEPT %llu %d\n"</span>, sub.id, nt); fflush(stdout);   <span class="cm">/* c/colibri.c:9283 */</span></pre>
+    </div>
+  </div>
+
+  <div class="pipe">▼ &nbsp; forward pass &nbsp; <span class="frame">embed → layers → lm_head → logits[vocab]</span> &nbsp;▼</div>
+
+  <!-- ============ STAGE 4 : C forward ============ -->
+  <div class="stage">
+    <div class="bar c"><span class="badge">C</span> <span class="fn">colibri.c — spec_decode drives step() → layers → logits</span> <span class="loc">c/colibri.c:7893,9642 · c/qwen36.c:2900</span></div>
+    <div class="body">
+      <div class="why">Generation runs through <code>spec_decode</code> (which supports multi-token prediction); each forward is <code>step()</code>: embed → N×(RMSNorm→attention→router→top-k experts)→ lm_head → a logits row over the whole vocab.</div>
+      <pre class="code"><span class="kw">static int</span> <span class="ck">spec_decode</span>(Model *m, <span class="kw">int</span> *all, <span class="kw">int</span> kv, <span class="kw">int</span> n_new, <span class="kw">int</span> eos,
+                      <span class="kw">float</span> *logit, ...){                  <span class="cm">/* c/colibri.c:7893 */</span>
+    <span class="kw">int</span> next = <span class="ck">pick_tok</span>(logit, V, carry_ban);  <span class="cm">/* choose next id   (c/colibri.c:7917) */</span>
+    ...
+    prod = <span class="ck">spec_decode</span>(m, hist, len, cur, eos, logit,
+                        emit_stream, &amp;es, NULL, NULL);      <span class="cm">/* c/colibri.c:9642 */</span>
+
+<span class="cm">// inside step() (qwen36.c:2900):</span>
+<span class="ck">layers_forward_range</span>(m, x, S, pos_base, <span class="num">0</span>, c-&gt;n_layers, <span class="num">1</span>, lf); <span class="cm">/* the layers */</span>
+... rmsnorm_row(last, ...); <span class="ck">matmul_d</span>(logit, last, &amp;m-&gt;lm_head, ...);  <span class="cm">/* lm_head → logits */</span></pre>
+    </div>
+  </div>
+
+  <!-- ============ STAGE 5 : C sample ============ -->
+  <div class="stage">
+    <div class="bar c"><span class="badge">C</span> <span class="fn">sample.h — pick_tok(): pick the "hey" id from logits</span> <span class="loc">c/sample.h:100</span></div>
+    <div class="body">
+      <div class="why">If <code>temp&lt;=0</code> it's greedy <code>argmax</code>; otherwise build a temperature/top-p distribution and sample. Result: id for <code>"hey"</code> (e.g. <code>3189</code>).</div>
+      <pre class="code"><span class="kw">static int</span> <span class="ck">pick_tok</span>(<span class="kw">const float</span> *lo, <span class="kw">int</span> V, <span class="kw">int</span> ban){   <span class="cm">/* c/sample.h:100 */</span>
+    <span class="kw">if</span> (g_temp &lt;= <span class="num">0</span>){
+        <span class="kw">int</span> a = <span class="ck">argmax_v</span>(lo, V);                 <span class="cm">/* greedy → "hey" */</span>
+        <span class="kw">return</span> a;
+    }
+    <span class="ck">dist_build</span>(lo, V);                          <span class="cm">/* temp + top-p softmax */</span>
+    <span class="kw">return</span> <span class="ck">dist_sample</span>(V, ban);                <span class="cm">/* sample */</span>
+}</pre>
+    </div>
+  </div>
+
+  <div class="pipe">▼ &nbsp; detokenize id → UTF-8 &nbsp; <span class="frame">3189 → "hey"</span> &nbsp;▼</div>
+
+  <!-- ============ STAGE 6 : C emit DATA ============ -->
+  <div class="stage">
+    <div class="bar c"><span class="badge">C</span> <span class="fn">colibri.c — emit_stream writes one DATA frame</span> <span class="loc">c/colibri.c:9012</span></div>
+    <div class="body">
+      <div class="why">The chosen id is decoded back to text bytes and written to stdout as a byte-counted <code>DATA</code> frame.</div>
+      <pre class="code"><span class="cm">// one generated token → one DATA frame (c/colibri.c:9002–9014)</span>
+printf(<span class="str">"DATA %llu %d\n"</span>, id, n);   <span class="cm">/* header: id + byte count */</span>
+<span class="ck">fwrite</span>(bytes, <span class="num">1</span>, n, stdout);          <span class="cm">/* payload: "hey" */</span>
+printf(<span class="str">"\n"</span>); fflush(stdout);</pre>
+    </div>
+  </div>
+
+  <div class="pipe">▲ &nbsp; engine stdout &nbsp; <span class="frame">DATA 1 3\nhey\n</span> &nbsp;▲</div>
+
+  <!-- ============ STAGE 7 : Python receive ============ -->
+  <div class="stage">
+    <div class="bar py"><span class="badge">PYTHON</span> <span class="fn">c/openai_server.py — read frame, stream SSE back to you</span> <span class="loc">c/openai_server.py:3168,3672</span></div>
+    <div class="body">
+      <div class="why">The gateway reads the <code>DATA</code> frame, reassembles UTF-8 across frame boundaries, and pushes each token as an SSE <code>delta</code>. A stop filter ends the turn.</div>
+      <pre class="code"><span class="pyk">read_engine_turn</span>(self.process.stdout, READY, ...)        <span class="cm"># line 3168</span>
+...
+def <span class="pyk">decode</span>(data):                                    <span class="cm"># incremental UTF-8 (line 3672)</span>
+    text = decoder.decode(data)
+    <span class="kw">if</span> text: <span class="pyk">on_text</span>(text)                    <span class="cm"># → SSE: data: {"delta":{"content":"hey"}}</span></pre>
+    </div>
+  </div>
+
+  <!-- ============ SUMMARY TABLE ============ -->
+  <h2 class="sec">The whole turn, one line each</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Stage</th><th>Lang</th><th>Real call that runs</th><th>File:line</th></tr></thead>
+      <tbody>
+        <tr><td>Read keystroke, launch engine</td><td class="py-c">Python</td><td><code>subprocess.Popen(...)</code></td><td><code>c/coli</code></td></tr>
+        <tr><td>Render "hi" + write frame</td><td class="py-c">Python</td><td><code>Engine.generate()</code> → <code>_write_all(..., "SUBMIT")</code></td><td><code>c/openai_server.py:3652,3743</code></td></tr>
+        <tr><td>BPE-tokenize "hi" → ids</td><td class="c-c">C</td><td><code>tok_encode()</code> → <code>encode_text()</code> → <code>bpe_piece()</code></td><td><code>c/colibri.c:9268 · c/qwen36.c:301</code></td></tr>
+        <tr><td>Forward → logits</td><td class="c-c">C</td><td><code>spec_decode()</code> → <code>step()</code> → <code>layers_forward_range()</code> → <code>matmul_d(lm_head)</code></td><td><code>c/colibri.c:7893,9642 · c/qwen36.c:2900</code></td></tr>
+        <tr><td>Pick "hey" id</td><td class="c-c">C</td><td><code>pick_tok()</code> → <code>argmax_v()</code>/<code>dist_sample()</code></td><td><code>c/sample.h:100</code></td></tr>
+        <tr><td>Emit bytes</td><td class="c-c">C</td><td><code>emit_stream</code> → <code>printf("DATA ...")</code></td><td><code>c/colibri.c:9012</code></td></tr>
+        <tr><td>Read frame, stream SSE</td><td class="py-c">Python</td><td><code>read_engine_turn()</code> → <code>decode()</code> → <code>on_text()</code></td><td><code>c/openai_server.py:3168,3672</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <footer>Real function names and line numbers pulled from the <code>colibri</code> source. Token ids are illustrative; the call chain is exact.</footer>
+
+</div>
+</body>
+</html>

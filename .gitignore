@@ -139,6 +139,24 @@ c/qwen38_2p4t_tiny_c/
 # not vendored): the DeepSeek V4 DeepGEMM flavour's headers.
 c/third_party/deepgemm/
 
+# Unified engine ABI (engine.h) harness + benchmarks. Extensionless binaries in
+# c/, same as the engine list above; the sources stay tracked.
+c/agent_main
+c/agent_main_olmoe
+c/bench_glm
+c/bench_olmoe
+c/libcolibri_engine.o
+c/libolmoe_engine.o
+c/engine_registry.o
+# orchestration-layer A/B (c/bench_orchestration/): sources tracked, binaries not
+c/bench_orchestration/stub_engine
+c/bench_orchestration/orch_c
+c/bench_orchestration/orch_cpp
+# tier A/B local artifacts (c/bench_tier/): compiled token-id dumper and a
+# generated per-layer route trace; harness sources/JSONL stay tracked
+c/bench_tier/tok_ids
+c/bench_tier/route200.txt
+
 # DLL flavours + MSVC import/export artifacts of the V4 CUDA tier (regenerated
 # by cuda-dsv4-dll / cuda-dsv4-dg-dll); the loader picks the DLL at runtime.
 c/coli_cuda_dsv4*.dll

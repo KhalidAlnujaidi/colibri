@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Colibrì — "hi" → "hey": The Orchestration Layers, Rewritten in C/C++</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2330;
+    --border: #2d333b;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --py: #f0db4f;
+    --c: #89cff0;
+    --cpp: #f17f3f;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --red: #f85149;
+    --mono: "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font-family: -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; line-height: 1.5; }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 32px 24px 80px; }
+
+  header.hero { border: 1px solid var(--border); border-radius: 12px; background: linear-gradient(135deg,#161b22,#1c2330); padding: 26px 30px; margin-bottom: 18px; }
+  header.hero h1 { margin: 0 0 6px; font-size: 24px; }
+  header.hero h1 .cpp { color: var(--cpp); }
+  header.hero p { margin: 0; color: var(--muted); max-width: 720px; }
+
+  .stage { border: 1px solid var(--border); border-radius: 12px; overflow: hidden; margin: 18px 0; background: var(--panel); }
+  .stage .bar { display: flex; align-items: center; gap: 10px; padding: 9px 16px; font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  .bar .badge { font-size: 11px; padding: 2px 9px; border-radius: 999px; letter-spacing: .3px; }
+  .bar .fn { color: var(--text); font-weight: 400; }
+  .bar .note { margin-left: auto; color: var(--muted); font-weight: 400; font-size: 11px; }
+
+  .bar.python { background: #2a2710; border-bottom: 1px solid #5c5a2e; color: var(--py); }
+  .bar.python .badge { background: var(--py); color: #0d1117; }
+  .bar.cpp { background: #2c1c10; border-bottom: 1px solid #6b4a2a; color: var(--cpp); }
+  .bar.cpp .badge { background: var(--cpp); color: #0d1117; }
+
+  .stage .body { padding: 14px 18px; }
+  .stage .body .why { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+  .stage .body .why b { color: var(--text); }
+
+  .sidebyside { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 720px){ .sidebyside { grid-template-columns: 1fr; } }
+  .langbox { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  .langbox .lhead { font-family: var(--mono); font-size: 11px; padding: 4px 10px; letter-spacing: .3px; font-weight: 600; }
+  .langbox .lhead.py { background: #2a2710; color: var(--py); }
+  .langbox .lhead.cpp { background: #2c1c10; color: var(--cpp); }
+
+  pre.code { margin: 0; padding: 10px 12px; background: #0a0e14; font-family: var(--mono); font-size: 12px; line-height: 1.5; overflow-x: auto; white-space: pre; }
+  pre.code .cm { color: #6a737d; }
+  pre.code .kw { color: var(--accent); }
+  pre.code .str { color: #a5d6ff; }
+  pre.code .num { color: #f0883e; }
+  pre.code .pyk { color: var(--py); }
+  pre.code .ck { color: var(--c); }
+  pre.code .cppk { color: var(--cpp); }
+  pre.code .g { color: var(--green); }
+
+  .pipe { text-align: center; color: var(--muted); font-family: var(--mono); font-size: 13px; padding: 6px 0; }
+  .pipe .frame { color: var(--green); background: #0d2818; border: 1px solid #2e5c44; padding: 2px 10px; border-radius: 6px; font-size: 12px; }
+
+  h2.sec { font-size: 18px; margin: 40px 0 10px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+
+  .table-wrap { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 8px 4px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-family: var(--mono); font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); white-space: nowrap; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  .c-c { color: var(--c); } .cpp-c { color: var(--cpp); }
+
+  .callout { border-left: 3px solid var(--red); background: var(--panel); padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 18px 0; font-size: 13.5px; }
+  .callout b { color: var(--red); }
+  .callout code { font-family: var(--mono); font-size: 12px; }
+
+  footer { margin-top: 46px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; text-align: center; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="hero">
+    <h1>"hi" → "hey": the <span class="cpp">orchestration layers in C/C++</span></h1>
+    <p>The three Python stages (CLI launch, prompt render + SUBMIT write, frame read + SSE) rewritten in C and C++. The engine (<span style="color:#89cff0">C</span>) stays as-is — we're only translating the surrounding <i>glue</i>.</p>
+  </header>
+
+  <!-- ============ STAGE 1 ============ -->
+  <div class="stage">
+    <div class="bar python"><span class="badge">PYTHON</span> <span class="fn">1 · Read keystroke, launch engine</span> <span class="note">c/coli</span></div>
+    <div class="body">
+      <div class="why">Original: <b>Python</b> reads input, builds env, and <code>subprocess.Popen</code> spawns the engine with pipes.</div>
+      <div class="sidebyside">
+        <div class="langbox">
+          <div class="lhead py">Python (before)</div>
+          <pre class="code">cmd = [GLM, str(cap)]
+env = env_for(a); env[<span class="str">"SERVE"</span>] = <span class="str">"1"</span>
+p = subprocess.Popen(cmd, env=env,
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    bufsize=0)
+line = input()          <span class="cm"># "hi"</span>
+p.stdin.write(line.encode() + b<span class="str">"\n"</span>)</pre>
+        </div>
+        <div class="langbox">
+          <div class="lhead cpp">C (rewrite)</div>
+          <pre class="code"><span class="cm">// fork + exec the engine, wire up pipes</span>
+<span class="kw">int</span> to_engine[<span class="num">2</span>], from_engine[<span class="num">2</span>];
+<span class="cppk">pipe</span>(to_engine); <span class="cppk">pipe</span>(from_engine);
+pid_t pid = <span class="cppk">fork</span>();
+<span class="kw">if</span> (pid == <span class="num">0</span>) {
+    <span class="cppk">dup2</span>(to_engine[<span class="num">0</span>], STDIN_FILENO);
+    <span class="cppk">dup2</span>(from_engine[<span class="num">1</span>], STDOUT_FILENO);
+    <span class="cppk">execl</span>(GLM, GLM, cap_str, <span class="kw">NULL</span>);   <span class="cm">// engine = C process</span>
+}
+<span class="cm">// parent: read a line of input, forward it</span>
+<span class="kw">char</span> *line = <span class="kw">NULL</span>; <span class="kw">size_t</span> n = <span class="num">0</span>;
+getline(&amp;line, &amp;n, stdin);              <span class="cm">// "hi"</span>
+<span class="cppk">write</span>(to_engine[<span class="num">1</span>], line, strlen(line));</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ STAGE 2 ============ -->
+  <div class="stage">
+    <div class="bar python"><span class="badge">PYTHON</span> <span class="fn">2 · Render "hi" + write SUBMIT frame</span> <span class="note">c/openai_server.py:3652,3743</span></div>
+    <div class="body">
+      <div class="why">Original: <b>Python</b> wraps "hi" in the chat template, then <code>_write_all</code> emits a byte-counted <code>SUBMIT</code> line + payload.</div>
+      <div class="sidebyside">
+        <div class="langbox">
+          <div class="lhead py">Python (before)</div>
+          <pre class="code">prompt = (<span class="str">"&lt;|user|&gt;\nhi\n&lt;|end|&gt;\n"</span>
+          <span class="str">"&lt;|assistant|&gt;"</span>)
+payload = prompt.encode(<span class="str">"utf-8"</span>)
+header = (f<span class="str">"SUBMIT {req_id} {slot} "</span>
+          f<span class="str">"{len(payload)} {max_tokens} "</span>
+          f<span class="str">"{temperature} {top_p}"</span>)
+_write_all(p.stdin,
+    header.encode() + payload + b<span class="str">"\n"</span>,
+    <span class="str">"SUBMIT"</span>)</pre>
+        </div>
+        <div class="langbox">
+          <div class="lhead cpp">C (rewrite)</div>
+          <pre class="code"><span class="kw">const char</span> *prompt =
+    <span class="str">"&lt;|user|&gt;\nhi\n&lt;|end|&gt;\n&lt;|assistant|&gt;"</span>;
+<span class="kw">int</span> payload_len = (int)strlen(prompt);
+<span class="kw">char</span> header[<span class="num">128</span>];
+<span class="cppk">snprintf</span>(header, <span class="kw">sizeof</span> header,
+    <span class="str">"SUBMIT %llu %d %d %d %g %g\n"</span>,
+    req_id, slot, payload_len,
+    max_tokens, temperature, top_p);
+<span class="cppk">write</span>(fd_in, header, strlen(header));  <span class="cm">// header + \n</span>
+<span class="cppk">write</span>(fd_in, prompt, payload_len);     <span class="cm">// payload, exact bytes</span>
+<span class="cppk">write</span>(fd_in, <span class="str">"\n"</span>, <span class="num">1</span>);</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="pipe">▼ &nbsp; engine stdin &nbsp; <span class="frame">SUBMIT 1 0 2 64 0.7 1.0\n&lt;|user|&gt;\nhi\n&lt;|end|&gt;\n&lt;|assistant|&gt;\n</span> &nbsp;▼</div>
+
+  <div class="stage">
+    <div class="bar" style="background:#0f2733;border-bottom:1px solid #2e5c74;color:var(--c)"><span class="badge" style="background:var(--c);color:#0d1117">C</span> <span class="fn">THE ENGINE — unchanged (tok_encode → step → pick_tok → DATA)</span> <span class="note">c/colibri.c, c/qwen36.c, c/sample.h</span></div>
+    <div class="body">
+      <div class="why">Nothing changes here — the engine is already C. It reads the frame, emits <code>DATA 1 3\nhey\n</code>.</div>
+    </div>
+  </div>
+
+  <div class="pipe">▲ &nbsp; engine stdout &nbsp; <span class="frame">DATA 1 3\nhey\n</span> &nbsp;▲</div>
+
+  <!-- ============ STAGE 3 ============ -->
+  <div class="stage">
+    <div class="bar python"><span class="badge">PYTHON</span> <span class="fn">3 · Read frame, stream SSE</span> <span class="note">c/openai_server.py:3168,3672</span></div>
+    <div class="body">
+      <div class="why">Original: <b>Python</b> reads <code>DATA &lt;id&gt; &lt;n&gt;</code>, then exactly <code>n</code> bytes, reassembles UTF-8 incrementally, and emits SSE.</div>
+      <div class="sidebyside">
+        <div class="langbox">
+          <div class="lhead py">Python (before)</div>
+          <pre class="code">fields = line.decode().split()
+size = int(fields[2])
+body = self._read_exact(size)      <span class="cm"># n bytes of UTF-8</span>
+text = decoder.decode(body)        <span class="cm"># incremental UTF-8</span>
+if text: on_text(text)             <span class="cm"># → SSE delta</span>
+# … repeat until DONE / stop</pre>
+        </div>
+        <div class="langbox">
+          <div class="lhead cpp">C (rewrite)</div>
+          <pre class="code"><span class="cm">// read one line:  "DATA 1 3"</span>
+<span class="kw">char</span> kind[<span class="num">8</span>]; <span class="kw">unsigned long long</span> id;
+<span class="kw">int</span> n;
+<span class="kw">if</span> (<span class="cppk">fscanf</span>(f_out, <span class="str">"%7s %llu %d\n"</span>,
+           kind, &amp;id, &amp;n) != <span class="num">3</span>) <span class="kw">break</span>;
+<span class="kw">if</span> (strcmp(kind, <span class="str">"DATA"</span>)) <span class="kw">continue</span>;   <span class="cm">// or DONE/ERROR</span>
+<span class="kw">char</span> buf[<span class="num">65536</span>];
+<span class="cppk">fread</span>(buf, <span class="num">1</span>, n, f_out);            <span class="cm">// exactly n bytes: "hey"</span>
+<span class="cppk">fgetc</span>(f_out);                        <span class="cm">// trailing '\n'</span>
+fwrite(buf, <span class="num">1</span>, n, stdout);         <span class="cm">// stream it out</span>
+fflush(stdout);                       <span class="cm">// → SSE `data: ...`</span></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ WHY NOT ============ -->
+  <h2 class="sec">Why the rewrite is mechanical — but the Python is still there</h2>
+  <div class="callout">
+    <b>Good:</b> these three stages are pure glue — byte framing and process wiring — so they translate cleanly to C/C++ (<code>pipe</code>/<code>fork</code>/<code>exec</code>, <code>fscanf</code>/<code>fread</code>). Nothing about the math changes.
+    <br><br>
+    <b>Why the real repo keeps them in Python:</b> the render step needs the full chat-template library per family, SSE/HTTP needs a server, tool-call framing and JSON parsing are far less painful in Python, and the gateway is only in the <i>serve</i> path — the engine itself is already pure C. Rewriting this glue would trade ergonomics for no speed (the engine is the bottleneck, not a pipe read).
+  </div>
+
+  <!-- ============ SUMMARY TABLE ============ -->
+  <h2 class="sec">Before → After (C)</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Stage</th><th>Python</th><th>C/C++ equivalent</th></tr></thead>
+      <tbody>
+        <tr><td>Read keystroke, launch engine</td><td class="cpp-c"><code>subprocess.Popen</code> + <code>input()</code></td><td class="c-c"><code>pipe()</code> → <code>fork()</code> → <code>dup2()</code> → <code>execl()</code>, <code>getline()</code></td></tr>
+        <tr><td>Render "hi" + write frame</td><td class="cpp-c"><code>prompt.encode()</code> + <code>_write_all("SUBMIT")</code></td><td class="c-c"><code>snprintf(header)</code> + <code>write()</code> header/payload/`\n`</td></tr>
+        <tr><td>Read frame, stream SSE</td><td class="cpp-c"><code>read_engine_turn()</code> → <code>decode()</code> → <code>on_text()</code></td><td class="c-c"><code>fscanf()</code> → <code>fread(n)</code> → <code>fwrite()</code> → <code>fflush()</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <footer>Translations preserve the exact wire format from <code>docs/serve_protocol.md</code>. The engine stage is untouched — it is already C.</footer>
+
+</div>
+</body>
+</html>
