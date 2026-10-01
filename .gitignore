@@ -125,6 +125,10 @@ c/olmoe_i4/
 c/tiny_inkling/
 c/qwen38_tiny/
 c/dsv41_tiny/
+c/qwen36_tiny/
+c/qwen36_tiny_c/
+c/qwen38_2p4t_tiny/
+c/qwen38_2p4t_tiny_c/
 
 # Claude Code working directory (agent worktrees, session scratch) — never a repo artifact
 .claude/
@@ -151,3 +155,4 @@ c/kimi_k3_tiny/.vendor_kimi_k3/
 c/kimi_k3_tiny/.coli_usage
 c/qwen38_vision_tiny/
 c/qwen38_mm_tiny/
+c/qwen38_tiny_fp8/

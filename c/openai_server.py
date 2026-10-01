@@ -259,6 +259,22 @@ _PARTIAL_END_RE = re.compile(r"<(?:/(?:t(?:o(?:o(?:l(?:_(?:c(?:a(?:l)?)?)?)?)?)?
 _SALVAGE = os.environ.get("COLI_TOOL_SALVAGE", "0") == "1"
 
 
+def _tool_choice_name(tool_choice):
+    """The tool name a dict `tool_choice` forces, or None.
+
+    `.get` is taken only from a dict. Writing the name where the object goes --
+    {"type": "function", "function": "search"} instead of
+    {"function": {"name": "search"}} -- raised AttributeError in the five
+    renderers that read this and in generation_options() itself, and do_POST
+    answered HTTP 500 "The colibri engine failed to process the request." for a
+    payload generation_options() already has a 400 for. Same shape as the
+    json_schema fix (#1587): read the member, then check it.
+    """
+    function = tool_choice.get("function")
+    return ((function if isinstance(function, dict) else {}).get("name")
+            or tool_choice.get("name"))
+
+
 def _tool_param_order(tools):
     """name -> ordered param names (required first) from the request schema, for de-mangling."""
     out = {}
@@ -992,7 +1008,7 @@ def render_chat_kimi(messages, enable_thinking=False, reasoning_effort=None, too
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name") or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1083,8 +1099,7 @@ def render_chat_v4(messages, enable_thinking=False, reasoning_effort=None, tools
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1554,8 +1569,7 @@ def render_chat(messages, enable_thinking=False, reasoning_effort=None, tools=No
         prompt.append(f"<|system|>Reasoning Effort: {effort}")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1640,14 +1654,18 @@ GLM53_IMAGE_OPEN, GLM53_IMAGE, GLM53_IMAGE_CLOSE = (
 def _image_bytes_from_url(url):
     """data: URI, file:// o percorso sul disco -> i byte dell'immagine.
 
-    A local path is read with the server process's own permissions. On a
-    server that binds beyond loopback (which already requires an API key),
-    an authenticated client could otherwise read any file the process can
-    reach -- e.g. "file:///etc/passwd". Two guards without breaking the
-    documented loopback single-user case: '..' is refused outright (never
-    needed for a real image path), and if COLI_IMAGE_ROOT is set the resolved
-    path must stay inside it, mirroring serve_static's relative_to() check.
-    Errors stay generic so the reply never confirms a path or its permissions."""
+    A local path is read with the server process's own permissions, and an
+    inference client is not the operator: with the API key it could read any
+    file the process can reach ("file:///etc/passwd", or a bare "/etc/passwd").
+    #1354 refused '..' and confined reads to COLI_IMAGE_ROOT when set, which
+    left every absolute path readable on the default install (the variable is
+    unset out of the box). So local paths are now denied unless the operator
+    sets COLI_IMAGE_ROOT, and then only inside it (resolve() follows symlinks
+    before the relative_to() check, the same one serve_static uses). The
+    clients that used to send paths read the file themselves with the user's
+    own rights and send a data: URI: `coli chat` since this change, `coli web`
+    always did. Errors stay generic so a reply never confirms a path or its
+    permissions."""
     if not isinstance(url, str) or not url:
         raise APIError(400, "image_url.url must be a non-empty string.", "messages")
     if url.startswith("data:"):
@@ -1666,13 +1684,20 @@ def _image_bytes_from_url(url):
                             "as a base64 data: URI or a path on this machine.",
                        "messages")
     raw = url[7:] if url.startswith("file://") else url
+    image_root = os.environ.get("COLI_IMAGE_ROOT")
+    if not image_root:
+        raise APIError(400, "local image paths are disabled on this server: send the image "
+                            "as a base64 data: URI (coli chat and coli web do), or start the "
+                            "server with COLI_IMAGE_ROOT=<dir> to allow files under that "
+                            "directory.", "messages")
     if ".." in Path(raw).parts:
         raise APIError(400, "image path is not allowed.", "messages")
     try:
+        root = Path(image_root).resolve(strict=True)
+        if not root.is_dir():
+            raise ValueError("COLI_IMAGE_ROOT is not a directory")
         target = Path(raw).resolve()
-        image_root = os.environ.get("COLI_IMAGE_ROOT")
-        if image_root:
-            target.relative_to(Path(image_root).resolve())
+        target.relative_to(root)
     except (ValueError, OSError):
         raise APIError(400, "image path is not allowed.", "messages")
     try:
@@ -1927,8 +1952,7 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
 
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -1984,8 +2008,22 @@ def render_chat_glm53(messages, enable_thinking=False, reasoning_effort=None, to
                 reasoning = content.split("</think>")[0].split("<think>")[-1]
                 content = content.split("</think>")[-1]
             opened = f"<think>{reasoning}</think>" if isinstance(reasoning, str) else "<think></think>"
-            prompt.append(f"<|assistant|>{opened}{content.strip()}"
-                          f"{_glm53_tool_calls(message.get('tool_calls'))}")
+            body = content.strip()
+            calls = _glm53_tool_calls(message.get("tool_calls"))
+            # The template writes "\n<tool_call>". The model, on a turn that is
+            # nothing but a tool call, writes "</think><tool_call>" with no
+            # newline between them, and that one token is enough to throw away
+            # the whole cached prefix: the reuse gate in glm53.c is
+            # all-or-nothing, so the next turn re-prefills from scratch -- on a
+            # 3k-token agent history at 2.3 tok/s, twenty minutes (#1576).
+            #
+            # A turn that also has text is left exactly as it was. There the
+            # model's own trailing newline is stripped by .strip() and put back
+            # by the renderer, so the tokens already line up, and changing that
+            # case would break the one that works today.
+            if calls and not body:
+                calls = calls.lstrip("\n")
+            prompt.append(f"<|assistant|>{opened}{body}{calls}")
         else:
             raise APIError(400, f"unsupported message role {role!r}.", "messages")
 
@@ -2113,8 +2151,7 @@ def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, to
         raise APIError(400, "`messages` must be a non-empty array.", "messages")
     forced = None
     if isinstance(tool_choice, dict):
-        forced = ((tool_choice.get("function") or {}).get("name")
-                  or tool_choice.get("name"))
+        forced = _tool_choice_name(tool_choice)
         if forced:
             tools = [t for t in (tools or [])
                      if ((t.get("function", t) if isinstance(t, dict) else {}).get("name") == forced)]
@@ -2634,7 +2671,7 @@ def generation_options(body, limit):
                 raise APIError(400, "`tool_choice` must be one of \"auto\", \"none\", \"required\", "
                                     "or a function object.", "tool_choice", "unsupported_value")
         elif isinstance(choice, dict):
-            name = (choice.get("function") or {}).get("name") or choice.get("name")
+            name = _tool_choice_name(choice)
             if not name:
                 raise APIError(400, "`tool_choice` function object must include a name.",
                                "tool_choice", "invalid_value")
@@ -2670,7 +2707,8 @@ def generation_options(body, limit):
         if ftype == "json_object":
             grammar = GENERIC_JSON_GBNF
         elif ftype == "json_schema":
-            schema = (response_format.get("json_schema") or {}).get("schema")
+            json_schema = response_format.get("json_schema")
+            schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
             if not isinstance(schema, dict):
                 raise APIError(400, "`response_format.json_schema.schema` must be an object.",
                                "response_format", "invalid_value")
@@ -3661,6 +3699,14 @@ class APIHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
+        try:
+            # An escaped lone surrogate ("\ud83d") parses, but it is the same invalid
+            # text as the undecodable bytes above: no UTF-8 can carry it, and the
+            # engine protocol encodes every prompt as UTF-8.
+            json.dumps(body, ensure_ascii=False).encode("utf-8")
+        except UnicodeEncodeError:
+            raise APIError(400, "Request body contains an unpaired UTF-16 surrogate "
+                                "escape; strings must be valid Unicode.")
         if not isinstance(body, dict):
             raise APIError(400, "Request body must be a JSON object.")
         return body

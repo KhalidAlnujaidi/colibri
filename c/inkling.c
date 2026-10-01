@@ -717,6 +717,17 @@ static void load_cfg(Cfg *c, const char *snap) {
 }
 
 /* ---------- weight loading ---------- */
+/* The embedding norm has two names. The converter and every container written with
+ * transformers up to 5.17 call it model.embed_norm.weight; transformers 5.18 saves
+ * the same tensor as model.embed_tokens.embed_norm.weight. Read by the old name
+ * only, a checkpoint saved by 5.18 loaded with no embedding norm at all -- no
+ * error, and every answer wrong (the tiny oracle: 1 of 36 positions). */
+static const char *embed_norm_name(shards *S) {
+    if (st_has(S, "model.embed_norm.weight")) return "model.embed_norm.weight";
+    if (st_has(S, "model.embed_tokens.embed_norm.weight")) return "model.embed_tokens.embed_norm.weight";
+    return NULL;
+}
+
 static float *load_t(Model *m, const char *name) {
     int64_t n = st_numel(&m->S, name);
     if (n < 0) { fprintf(stderr, "missing %s\n", name); exit(1); }
@@ -950,7 +961,7 @@ static void model_init_range(Model *m, const char *snap, int cap, int bits,
 #endif
     if (load_boundaries) {
         m->embed      = load_w(m, "model.embed_tokens.weight", 0);
-        m->embed_norm = st_has(&m->S,"model.embed_norm.weight") ? load_t(m,"model.embed_norm.weight") : NULL;
+        { const char *en = embed_norm_name(&m->S); m->embed_norm = en ? load_t(m, en) : NULL; }
         m->final_norm = load_t(m, "model.norm.weight");
         m->lm_head    = load_w(m, "lm_head.weight", 1);
     }
@@ -2102,12 +2113,19 @@ static void apply_rep_penalty(float *logit, int n, const int *hist, int nhist, f
     }
 }
 
-/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192) */
+/* reject a prompt that would overrun the served KV bound (CTX_MAX, default 8192).
+ * The refusal is the frame the gateway turns into a 400 context_length_exceeded
+ * (#506, #1381); free text here reached the client as a 500. One request is
+ * served at a time, so the returned buffer is only read before the next call. */
 static const char *prompt_reject(int np, int want) {
+    static char message[96];
     const char *cm = getenv("CTX_MAX");
     int ctx_max = cm ? atoi(cm) : 8192;
-    if (np + want > ctx_max) return "context exceeds CTX_MAX";
-    return NULL;
+    if (np + want <= ctx_max) return NULL;
+    snprintf(message, sizeof(message),
+             "CONTEXT_EXCEEDED prompt_tokens=%d requested=%d capacity=%d",
+             np, want, ctx_max);
+    return message;
 }
 
 typedef struct { char id[64]; int max_tok; float temp, top_p; char *payload; int plen;
@@ -3093,8 +3111,8 @@ static int inkling_edge_engine_open(
         model->has_q = model->Sq.n > 0;
     }
     model->embed = load_w(model, "model.embed_tokens.weight", 0);
-    model->embed_norm = st_has(&model->S, "model.embed_norm.weight")
-        ? load_t(model, "model.embed_norm.weight") : NULL;
+    const char *embed_norm = embed_norm_name(&model->S);
+    model->embed_norm = embed_norm ? load_t(model, embed_norm) : NULL;
     model->final_norm = load_t(model, "model.norm.weight");
     model->lm_head = load_w(model, "lm_head.weight", 1);
     char tokenizer_path[4096];
