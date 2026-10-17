@@ -3,6 +3,27 @@
 All notable changes to colibrì are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Added
+
+- SSSE3 integer-dot tier in `c/idot.h`: `maddubs`/`madd` kernels for
+  `dense_act_i8`, `dot_i8i8`, `dot_i4i8`, `dot_i4p_u` and `i4p_gidot_rows`
+  give pre-AVX2 x86-64 CPUs (SSSE3, no AVX2/FMA) an accelerated path where
+  they previously fell through to the scalar reference. Exact int32 sums,
+  so every ISA path stays bit-identical to the scalar reference.
+- `residency_sim.py --engine olmoe`: the offline residency simulator replays
+  OLMoE `ROUTE_TRACE` files with OLMoE's own cache traversal (one expert per
+  fetch, immediate admission into the per-layer LRU, 128-row prompt blocks in
+  ascending expert id), so expert-placement policies can be compared on a model
+  that runs on a CPU-only machine.
+- `residency_sim.py` control policies: `lru-warm` (LRU starting with the
+  training top-k), `lfu-cold` and `frequency-cold` (the training counts
+  dropped), `frequency-warm` (history picks the starting residents only). They
+  separate what routing history adds from what the replacement rule does; the
+  OLMoE held-out record (`docs/experiments/olmoe-routing-vs-lru-2026-10-17.md`)
+  uses them.
+
 ## [2.0.0] - 2026-10-06
 
 169 pull requests since v1.12.1, 88 of them from contributors. Every MoE

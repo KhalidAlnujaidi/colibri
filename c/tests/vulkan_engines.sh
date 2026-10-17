@@ -58,6 +58,12 @@ PY=${PY:-python3}
 export COLI_LOOKUP=${COLI_LOOKUP:-0} Q38_MTP=${Q38_MTP:-0}
 
 fail() { echo "FAIL: $*"; exit 1; }
+# san_diag <log>: 0 when the log holds a sanitizer diagnostic, which fails the case.
+# (#1988, a SEGV in Lavapipe's queue thread, was ours: a batch whose wait had timed out
+# had its experts freed under it. backend_vulkan.c keeps them now, test_vk_tier checks.)
+san_diag() {
+  grep -qaE "ERROR: AddressSanitizer|runtime error:" "$1"
+}
 
 # Every sanitized run below sets ASAN_OPTIONS with detect_stack_use_after_return=0:
 # ASan's fake stack frames are only 32-byte aligned, and on an AVX-512 runner
@@ -276,8 +282,10 @@ family_staged_faults() {
   done
   rm -f hist.usage
   # the chain: a failure before it starts declines it (or leaves one matrix behind), a
-  # lost device in the middle has the CPU rebuild the state
-  local C=(COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1)
+  # lost device in the middle has the CPU rebuild the state. The warm start fills no
+  # device here (COLI_VK_TIER_FILL=0): the fill's uploads would take the waits counted
+  # from the run's submits, and wait:S-2 would land before the chain's first step
+  local C=(COLI_VK_CHAIN=1 COLI_VK_TIER_SYNC=1 COLI_VK_TIER_FILL=0)
   fault_run "faults: qwen36 chain, none" "" q.tok "${C[@]}" -- "${q[@]}"
   S=$(fault_num 's/.*copies (\([0-9]*\) submits).*/\1/p' vk.log)
   for f in stage:1 block:1 record:4 submit:4 commit:1 wait:4 wait:$((S - 2)); do
@@ -352,6 +360,7 @@ dense_where() {
 # can end before the uploader thread is first scheduled (it did in 5 of 40 runs with
 # the trunk on the CPU), so the gate waits for each staged upload at the next step.
 tier_gate() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local eng=$1 tag=$2; shift 2
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f tier.usage
@@ -522,7 +531,7 @@ family_qwen_sanitize() {
     rm -f tier.usage
     env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
     echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'dense matrices on the [a-zA-Z]*' san.log | head -1)"
   }
@@ -732,7 +741,7 @@ family_inkling_olmoe_sanitize() {
     [ "${KEEP:-0}" = 1 ] || rm -f tier.usage
     env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
     echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)$(grep -a -o 'warm start, [0-9]* experts' san.log | sed 's/^/, /')"
   }
@@ -968,6 +977,7 @@ family_deepseek() {
   # must also have evicted. COLI_USAGE points at a fresh history, COLI_VK_TIER_SYNC=1
   # awaits each staged upload at the next step (as in tier_gate).
   v41_tier() {  # <tag> <env and argv...>
+    if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
     local tag=$1; shift
     rm -f tier.usage
     env "$@" > v41-cpu.txt 2> v41-cpu.err || { cat v41-cpu.err; fail "deepseek_v41 tier $tag: CPU run"; }
@@ -1040,6 +1050,7 @@ sys.argv = ["make_deepseek_v4_tiny.py", "--output", sys.argv[2], "--force"]
 gen.main()
 PY
   v4_tier() {  # <tag> <fixture> <case> <env...>
+    if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
     local tag=$1 fx=$2 c=$3; shift 3
     local p mt
     p=$($PY -c 'import json,sys; c=json.load(open(sys.argv[1]+"/ref.json"))["cases"][sys.argv[2]]; print("".join("<t%03d>" % t for t in c["prompt_ids"]))' $fx $c)
@@ -1135,7 +1146,7 @@ PY
     rm -f tier.usage deepseek_v4_tiny_t/.coli_usage deepseek_v4_tiny_e8/.coli_usage
     env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_USAGE=tier.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
     echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)"
   }
@@ -1155,7 +1166,7 @@ PY
   ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 > /dev/null 2>&1 || true
   env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 \
     ./deepseek_v4 ./deepseek_v4_tiny_e8 "$p" --raw-prompt --max-tokens 4 > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan deepseek_v4 warm start: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan deepseek_v4 warm start: sanitizer diagnostic"; fi
   grep -q '^\[VK\] tier deepseek_v4: warm start' san.log || { cat san.log; fail "asan deepseek_v4 warm start: no warm start"; }
   echo "OK asan deepseek_v4 warm start: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1)"
   rm -rf deepseek_v4_tiny_t deepseek_v4_tiny_e8 san.json
@@ -1181,6 +1192,7 @@ family_kimi() {
   # k3_gate <tag> <env...>: the tokens of the CPU run, the tier served some experts,
   # the shared experts where they were asked to be (dense_where); EVICT=1: it evicted
   k3_gate() {
+    if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
     local tag=$1 c; shift
     for c in short chunk long; do
       rm -f k3.usage
@@ -1249,7 +1261,7 @@ family_kimi_mimo_sanitize() {
     local eng=$1 tag=$2; shift 2
     env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
     echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)"
   }
@@ -1274,7 +1286,7 @@ family_kimi_mimo_sanitize() {
     env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 OMP_NUM_THREADS=2 \
       COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_IMG_BITS=32 COLI_IMG_ACT8=0 $qa ./qwenimage --model qwenimage_tiny --ref qwenimage_tiny/ref \
       > san.log 2>&1 || { cat san.log; fail "asan qwenimage chain $qa: the oracle"; }
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan qwenimage chain $qa: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan qwenimage chain $qa: sanitizer diagnostic"; fi
     grep -qa 'qwenimage chain: [0-9]* steps' san.log || { cat san.log; fail "asan qwenimage chain $qa: the chain never ran"; }
     echo "OK asan qwenimage chain $qa: sanitizers clean, the oracle within tolerance"
   done
@@ -1405,7 +1417,7 @@ family_mimo_chain_sanitize() {
   make mimo tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
   echo "OK asan: the chain's ops"
   $PY tools/make_mimo_tiny.py --output ./mimo_tiny --force --vision
   MGRID=$($PY -c "import json;i=json.load(open('mimo_tiny/ref.json'))['image'];print(i['grid_h'],i['grid_w'])")
@@ -1414,7 +1426,7 @@ family_mimo_chain_sanitize() {
     [ "$c" = image ] && x=(--image mimo_tiny/patches.f32 --grid $MGRID)
     env OMP_NUM_THREADS=2 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_TEMP=0 "$@" \
       ./mimo mimo_tiny --ids "$(mimo_ids $c prompt_ids)" --ngen 6 "${x[@]}" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(chain_count mimo san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
     echo "OK $tag: sanitizers clean, $(chain_count mimo san.log) chain forwards"
   }
@@ -1430,7 +1442,7 @@ family_mimo_chain_sanitize() {
   frames=$(sed -n 's/^\[VK\] mimo chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p' san.log | tail -1)
   env OMP_NUM_THREADS=2 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_TEMP=0 MIMO_DENSE_BITS=32 COLI_VK_CHAIN_ROWS=3 \
     COLI_VK_CHAIN_FAULT=$((frames - 100)) ./mimo mimo_tiny --ids "$(mimo_ids long prompt_ids)" --ngen 6 > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain mimo device lost: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan chain mimo device lost: sanitizer diagnostic"; fi
   grep -q "the device was lost at position [1-9]" san.log || { cat san.log; fail "asan chain mimo device lost: not lost inside the prompt"; }
   echo "OK asan chain mimo device lost: sanitizers clean, $(grep -o 'the device was lost at position [0-9]*' san.log)"
   mimo_served_fixture
@@ -1469,6 +1481,7 @@ glm_fixtures() {
 # greedy run (the warm start, and the device in a teacher-forced prefill). DEV2=1: the
 # second device's registry served experts ("+ N vk" in the hit-rate line).
 glm_tier() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 snap=$2 ref=$3; shift 3
   local envs=() pre=() e; while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   for e in "${envs[@]}"; do [ "${e%%=*}" = TF ] || pre+=("$e"); done
@@ -1496,6 +1509,7 @@ glm_tier() {
 # teacher_forcing and greedy lines; the history is a fresh COLI_USAGE file (HIST=1: one
 # greedy run writes it first).
 g53_tier() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 model=$2; shift 2
   local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   rm -f g53.usage
@@ -1617,7 +1631,7 @@ family_glm_sanitize() {
     env ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 COLI_USAGE=g53.usage \
       COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 "$@" > san.log 2>&1 || true
     rm -f g53.usage; [ "$snap" = - ] || rm -f "$snap/.coli_usage"
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(tier_count $eng san.log)" -gt 0 ] || { cat san.log; fail "$tag: no routed expert ran on the device"; }
     echo "OK $tag: sanitizers clean, $(grep -a -o 'device [0-9]* of [0-9]* routed experts' san.log | tail -1), $(grep -a -o 'evictions [0-9]*' san.log | tail -1)"
   }
@@ -1681,6 +1695,23 @@ chain_gate() {  # <engine> <tag> <tol 0|1> <env...> -- <argv...>   (CPUENV: the 
   echo "OK $tag: tokens = CPU$lg, $(chain_count "$eng" vk.log) chain forwards"
 }
 
+# dmoe_gate <engine> <tag> all|some|none <env...> -- <argv...>: chain_gate, and how many layer
+# steps ran their routed experts in the frame (vk_dmoe.h): all (no routed expert on the
+# host), some (beside host steps: the tier holds every expert of some layers only), none
+dmoe_gate() {
+  local eng=$1 tag=$2 want=$3; shift 3
+  chain_gate "$eng" "$tag" 1 "$@"
+  local n h
+  n=$(sed -n "s/^\[VK\] $eng chain: .* \([0-9]*\) layer steps with the routed experts in the frame.*/\1/p" vk.log | tail -1)
+  h=$(sed -n "s/^\[VK\] $eng chain: .* \([0-9.]*\) ms of routed experts on the host.*/\1/p" vk.log | tail -1)
+  case $want in
+    all) [ "${n:-0}" -gt 0 ] && [ "$h" = 0.0 ] ;;
+    some) [ "${n:-0}" -gt 0 ] && [ "${h:-0.0}" != 0.0 ] ;;
+    *) [ "${n:-0}" = 0 ] ;;
+  esac || { cat vk.log; fail "$tag: ${n:-?} layer steps in the frame, ${h:-?} ms of routed experts on the host (wanted $want)"; }
+  echo "OK $tag: ${n:-0} layer steps with the routed experts in the frame, ${h:-?} ms of routed experts on the host"
+}
+
 # lost_gate <engine> <tag> <frame> <env...> -- <argv...>: the device "lost" at the given
 # chain frame (COLI_VK_CHAIN_FAULT); the engine rebuilds the recurrent state on the CPU
 # from the prefix record and continues there: the CPU run's tokens all the same.
@@ -1737,8 +1768,18 @@ family_qwen_chain() {
   chain_gate qwen36 "chain qwen36 vision" 1 COLI_DENSE_I8=0 SNAP=qwen38_27b_vl_tiny_c -- 8 8 qwen38_27b_vl_tiny/ref.json
   QWEN36_VL_TINY=qwen38_27b_vl_tiny_c QWEN36_VL_REF=qwen38_27b_vl_tiny/ref.json COLI_VULKAN=1 COLI_VK_CHAIN=1 \
     COLI_USAGE=$PWD/chain.usage $PY -m unittest tests.test_qwen36_vision_serve
-  # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there
+  # the routed experts in the frame (vk_dmoe.h): every layer's (the warm start fills the
+  # tier), some layers' (a budget of 60 experts of 64, filled round the layers: four whole,
+  # the rest on the host, an eviction that changes the table mid-run), none
+  dmoe_gate qwen36 "chain qwen36 the routed experts in the frame" all COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  dmoe_gate qwen36 "chain qwen36 the routed experts in the frame, some layers" some COLI_VK_TIER_GB=0.00077 COLI_DENSE_I8=0 \
+    SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  dmoe_gate qwen36 "chain qwen36 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 COLI_DENSE_I8=0 \
+    SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  # the device lost mid-decode: the state rebuilt on the CPU, the run finishes there; in a
+  # step's frames on the host's routing, and in a step that is one frame
   lost_late qwen36 "chain qwen36 device lost" 20 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
+  DMOE=1 lost_late qwen36 "chain qwen36 device lost, the routed experts in the frame" 4 rebuild COLI_DENSE_I8=0 SNAP=qwen36_tiny_c -- 8 8 qwen36_tiny/ref_full.json
   # the prefix-reuse contract with the state on the device, and a serve session
   QWEN36_TINY=$PWD/qwen36_tiny_c COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_USAGE=$PWD/chain.usage $PY tests/test_qwen36_prefix_serve.py
   $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0
@@ -1773,8 +1814,15 @@ family_qwen_chain() {
     chain_gate qwen38 "chain qwen38 MTP $fx ${f:-drafting}" 1 OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=$f SNAP=$fx -- 2 8 $fx/ref.json
   done; done
   # the device lost mid-decode, once between steps and once inside an MTP verify
+  dmoe_gate qwen38 "chain qwen38 the routed experts in the frame" all OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  dmoe_gate qwen38 "chain qwen38 the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 OMP_NUM_THREADS=2 \
+    SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
   lost_late qwen38 "chain qwen38 device lost" 10 rebuild OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
-  lost_late qwen38 "chain qwen38 device lost in a verify" 15 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  lost_late qwen38 "chain qwen38 device lost in a verify" 15 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_FORCE=mixed \
+    SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  DMOE=1 lost_late qwen38 "chain qwen38 device lost, the routed experts in the frame" 3 rebuild OMP_NUM_THREADS=2 SNAP=qwen38_tiny -- 4 8 qwen38_tiny/ref.json
+  DMOE=1 lost_late qwen38 "chain qwen38 device lost in a verify, the routed experts in the frame" 3 rebuild OMP_NUM_THREADS=2 Q38_MTP=1 \
+    Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
   # the oracle targets with the chain on (COLI_VK_TIER_BALANCE=0: the int4 target wants
   # the same last logits from every expert path, and the balancer moves experts between
   # the device and the CPU by measured times); the MTP harness, whose prompt-cache and pin
@@ -1796,7 +1844,7 @@ family_qwen_chain_sanitize() {
   make qwen36 qwen38 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
   echo "OK asan: the chain's ops"
   $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
   $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
@@ -1812,7 +1860,7 @@ family_qwen_chain_sanitize() {
     local eng=$1 tag=$2; shift 2
     rm -f chain.usage
     env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(chain_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
     echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards"
   }
@@ -1825,7 +1873,7 @@ family_qwen_chain_sanitize() {
   csan qwen38 "asan chain qwen38 MTP reject" Q38_MTP=1 Q38_MTP_FORCE=reject SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
   csan qwen38 "asan chain qwen38 MTP mixed" Q38_MTP=1 Q38_MTP_FORCE=mixed SNAP=qwen38_tiny_int4_mtp ./qwen38 2 8 qwen38_tiny_int4_mtp/ref.json
   $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 > san.log 2>&1 || { cat san.log; fail "asan chain qwen38 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain qwen38 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan chain qwen38 serve: sanitizer diagnostic"; fi
   echo "OK asan chain qwen38 serve: $(tail -1 san.log)"
   make clean >/dev/null 2>&1 || true
 }
@@ -1904,6 +1952,10 @@ family_qwen_spec() {
     Q38_MTP_DRAFTS=3 Q38_MTP_FORCE=cycle SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
   lost_late qwen36 "spec chain qwen36 device lost mid-decode, lookup verifies" 20 rebuild COLI_DENSE_I8=0 COLI_LOOKUP=1 \
     COLI_SPEC_GATE=0 COLI_LOOKUP_FORCE=cycle SNAP=qwen36_tiny_v128_c -- 8 8 qwen36_tiny_v128/ref_full.json
+  DMOE=1 lost_late qwen38 "spec chain qwen38 device lost mid-decode, verifies of 4 rows, the routed experts in the frame" 3 rebuild \
+    OMP_NUM_THREADS=2 Q38_MTP=1 Q38_MTP_DRAFTS=3 Q38_MTP_FORCE=cycle SNAP=qwen38_tiny_mtp -- 2 8 qwen38_tiny_mtp/ref.json
+  DMOE=1 lost_late qwen36 "spec chain qwen36 device lost mid-decode, lookup verifies, the routed experts in the frame" 3 rebuild \
+    COLI_DENSE_I8=0 COLI_LOOKUP=1 COLI_SPEC_GATE=0 COLI_LOOKUP_FORCE=cycle SNAP=qwen36_tiny_v128_c -- 8 8 qwen36_tiny_v128/ref_full.json
 }
 # The same under ASan and UBSan: every run of the harness's quick subset (depth 3
 # rejected at rows 1 and 2 and cycling, lookup cycling and at row 3, a serve session
@@ -1914,10 +1966,10 @@ family_qwen_spec_sanitize() {
   make qwen36 qwen38 tests/test_spec_draft tests/test_qwen38_spec_alloc VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_spec_draft > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -q "behave as"; then cat san.log; fail "asan: spec_draft.h"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -q "behave as"; then cat san.log; fail "asan: spec_draft.h"; fi
   echo "OK asan: spec_draft.h"
   ./tests/test_qwen38_spec_alloc > san.log 2>&1 || { cat san.log; fail "asan: speculative allocation"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan: speculative allocation"; fi
+  if san_diag san.log; then cat san.log; fail "asan: speculative allocation"; fi
   echo "OK asan: speculative allocation"
   spec_fixtures
   local h="$PY tests/spec_drafts_harness.py --sanitize --quick" e
@@ -1975,6 +2027,31 @@ EOF
   mv tiny_inkling_q/dense-int4g64.safetensors tiny_inkling_q/dense-int4g64/dense.safetensors
   $PY tools/make_olmoe_tiny.py --output olmoe_tiny --force
   $PY tools/convert_olmoe_merged.py --model olmoe_tiny --out olmoe_tiny_c
+  # the dense part as OLMoE's own checkpoints have it, bf16 (allenai's base) or f16: every
+  # f32 the engine reads is a bf16 or an f16 widened
+  local half
+  for half in bf16 f16; do
+    rm -rf olmoe_tiny_${half}_c && cp -r olmoe_tiny_c olmoe_tiny_${half}_c
+    $PY - "olmoe_tiny_${half}_c/model-00000.safetensors" "$half" <<'EOF'
+import json, struct, sys, numpy as np
+p, half = sys.argv[1], sys.argv[2]
+raw = open(p, "rb").read(); n = struct.unpack("<Q", raw[:8])[0]; hdr = json.loads(raw[8:8 + n])
+out, blobs, off = {}, [], 0
+for k, v in hdr.items():
+    if k == "__metadata__": out[k] = v; continue
+    b, dt = raw[8 + n + v["data_offsets"][0]: 8 + n + v["data_offsets"][1]], v["dtype"]
+    if dt == "F32" and half == "bf16":
+        u = np.frombuffer(b, np.float32).view(np.uint32).astype(np.uint64)
+        b, dt = ((u + 0x7FFF + ((u >> 16) & 1)) >> 16).astype(np.uint16).tobytes(), "BF16"
+    elif dt == "F32":
+        b, dt = np.frombuffer(b, np.float32).astype(np.float16).tobytes(), "F16"
+    out[k] = {"dtype": dt, "shape": v["shape"], "data_offsets": [off, off + len(b)]}
+    blobs.append(b); off += len(b)
+h = json.dumps(out).encode(); h += b" " * (-len(h) % 8)
+with open(p, "wb") as f:
+    f.write(struct.pack("<Q", len(h))); f.write(h); [f.write(b) for b in blobs]
+EOF
+  done
   inkling_olmoe_tier_fixtures
 }
 
@@ -2010,10 +2087,12 @@ lost_gate_redo() {  # <engine> <tag> <frame> <env...> -- <argv...>
 
 # The device lost `back` frames before the end of a run (a probe run counts the frames,
 # so the fault lands mid-decode on any device, whatever its setup submits): lost_gate
-# (the state rebuilt on the CPU) or lost_gate_redo (the step redone there).
+# (the state rebuilt on the CPU) or lost_gate_redo (the step redone there). The frames
+# counted are a step's on the host's routing (COLI_VK_CHAIN_MOE=0); DMOE=1 keeps the
+# routed experts in the frame, a step one frame (vk_dmoe.h).
 lost_late() {  # <engine> <tag> <frames back> rebuild|redo <env...> -- <argv...>
   local eng=$1 tag=$2 back=$3 kind=$4; shift 4
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local envs=(COLI_VK_CHAIN_MOE=${DMOE:-0}); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   env "${envs[@]}" COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 ./"$eng" "$@" > vk.log 2>&1 || true
   local f; f=$(sed -n "s/^\[VK\] $eng chain: [0-9]* forwards, \([0-9]*\) frames.*/\1/p" vk.log | tail -1)
   { [ -n "$f" ] && [ "$f" -gt "$back" ]; } || { cat vk.log; fail "$tag: the probe run reports no frames"; }
@@ -2072,7 +2151,25 @@ family_inkling_olmoe_chain() {
   chain_gate olmoe "chain olmoe tiled GEMM" 1 COLI_VK_GEMM_MIN_S=2 SNAP=olmoe_tiny_c -- 8 8 $OR
   chain_gate olmoe "chain olmoe the per-row GEMV" 1 COLI_VK_CHAIN_GEMV=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   CHAINMODE=2 chain_gate olmoe "chain olmoe prompts only" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
+  dmoe_gate olmoe "chain olmoe the routed experts in the frame" all SNAP=olmoe_tiny_c -- 8 8 $OR
+  dmoe_gate olmoe "chain olmoe the host's routing (COLI_VK_CHAIN_MOE=0)" none COLI_VK_CHAIN_MOE=0 SNAP=olmoe_tiny_c -- 8 8 $OR
   lost_late olmoe "chain olmoe device lost mid-decode" 7 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+  DMOE=1 lost_late olmoe "chain olmoe device lost mid-decode, the routed experts in the frame" 3 redo SNAP=olmoe_tiny_c -- 8 8 $OR
+  # a bf16 or f16 checkpoint's dense matrices go up as bf16 (fmt 11) or f16 (fmt 14): the
+  # CPU's tokens in about half the device bytes of the f32 snapshot's, with the host
+  # copies kept or dropped
+  local mf mb
+  chain_gate olmoe "chain olmoe f32 dense, its bytes" 1 SNAP=olmoe_tiny_c -- 8 8 $OR
+  mf=$(sed -n 's/^\[VK\] olmoe: .* matrices resident, \([0-9.]*\) MiB).*/\1/p' vk.log | tail -1)
+  for half in bf16 f16; do
+    chain_gate olmoe "chain olmoe $half dense" 1 SNAP=olmoe_tiny_${half}_c -- 8 8 $OR
+    mb=$(sed -n 's/^\[VK\] olmoe: .* matrices resident, \([0-9.]*\) MiB).*/\1/p' vk.log | tail -1)
+    $PY -c "import sys; f, b = float(sys.argv[1]), float(sys.argv[2]); sys.exit(0 if 0 < b < f else 1)" "${mf:-0}" "${mb:-0}" ||
+      fail "chain olmoe $half dense: ${mb:-?} MiB resident, not below the f32 snapshot's ${mf:-?} MiB"
+    echo "OK chain olmoe $half dense: $mb MiB resident against $mf MiB as f32"
+    chain_gate olmoe "chain olmoe $half dense on the device only" 1 COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_${half}_c -- 8 8 $OR
+  done
+  lost_late olmoe "chain olmoe bf16 dense on the device only, device lost mid-decode" 7 redo COLI_VK_DENSE_HOST=0 SNAP=olmoe_tiny_bf16_c -- 8 8 $OR
 
   # serve: a session of pins, prompt-cache extensions, a divergent prompt and logprobs
   # against the CPU's, frame by frame (and with prompts only); the prefix-reuse and
@@ -2101,14 +2198,14 @@ family_inkling_olmoe_chain_sanitize() {
   make inkling olmoe tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
   echo "OK asan: the chain's ops"
   inkling_olmoe_chain_fixtures
   csan() {  # <engine> <tag> <env and argv...>
     local eng=$1 tag=$2; shift 2
     rm -f chain.usage
     env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=${CHAINMODE:-1} "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     [ "$(chain_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
     echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards"
   }
@@ -2126,7 +2223,7 @@ family_inkling_olmoe_chain_sanitize() {
   for eng in inkling olmoe; do
     local snap=tiny_inkling; [ $eng = olmoe ] && snap=olmoe_tiny_c
     $PY tests/vulkan_chain_serve.py ./$eng $snap OMP_NUM_THREADS=2 INK_PREFIX_LOG=1 > san.log 2>&1 || { cat san.log; fail "asan chain $eng serve"; }
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain $eng serve: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan chain $eng serve: sanitizer diagnostic"; fi
     echo "OK asan chain $eng serve: $(tail -1 san.log)"
   done
   make clean >/dev/null 2>&1 || true
@@ -2298,7 +2395,7 @@ family_glm_chain_sanitize() {
   make colibri glm53 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
   echo "OK asan: the chain's ops"
   glm_chain_fixtures
   export OMP_NUM_THREADS=2 CAP_RAISE=0
@@ -2306,7 +2403,7 @@ family_glm_chain_sanitize() {
     local eng=$1 tag=$2; shift 2
     rm -f chain.usage
     env COLI_USAGE=chain.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     grep -q "$eng chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
     echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards"
   }
@@ -2326,7 +2423,7 @@ family_glm_chain_sanitize() {
     # shellcheck disable=SC2086
     CHAIN_SERVE_SLOTS=2 CHAIN_SERVE_DIALECT=$([ "${args%% *}" = ./colibri ] && echo colibri || echo numeric) \
       $PY tests/vulkan_chain_serve.py $args > san.log 2>&1 || { cat san.log; fail "asan chain serve $args"; }
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain serve $args: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan chain serve $args: sanitizer diagnostic"; fi
     echo "OK asan chain serve ${args%% *}: $(tail -1 san.log)"
   done
   for args in "3 SERVE_BATCH=1 IDOT=0 DSA_TOPK=4" "4 SERVE_BATCH=1 IDOT=0 COLI_VK_CHAIN_MUX=1"; do
@@ -2370,6 +2467,7 @@ PY
 # forward), and the run must say so; REBUILD=1: and rebuild the KDA state of some
 # positions on the CPU.
 k3c_gate() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 c frames fault; shift
   for c in ${K3C_CASES:-short chunk long}; do
     rm -f k3c.usage cpu.f32 vk.f32
@@ -2490,7 +2588,7 @@ family_kimi_chain_sanitize() {
   make kimi_k3 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
   echo "OK asan: the chain's ops"
   $PY tools/make_kimi_k3_tiny.py --output ./kimi_k3_tiny --force
   k3c_serve_fixture
@@ -2499,7 +2597,7 @@ family_kimi_chain_sanitize() {
     local tag=$1; shift
     rm -f k3c.usage
     env COLI_USAGE=$PWD/k3c.usage USAGE_SAVE=0 COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     grep -q "kimi_k3 chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
     echo "OK $tag: sanitizers clean, $(chain_count kimi_k3 san.log) chain forwards"
   }
@@ -2519,7 +2617,7 @@ family_kimi_chain_sanitize() {
   }
   CHAIN_SERVE_TOL=2e-2 $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 \
     K3_PREFIX_LOG=1 USAGE_SAVE=0 COLI_K3_CKPT=4 > san.log 2>&1 || { cat san.log; fail "asan chain kimi_k3 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan chain kimi_k3 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan chain kimi_k3 serve: sanitizer diagnostic"; fi
   echo "OK asan chain kimi_k3 serve: $(tail -1 san.log)"
   unset OMP_NUM_THREADS
   make clean >/dev/null 2>&1 || true
@@ -2627,6 +2725,7 @@ v4_chain_same() {
   echo "OK $tag (${c%%:*}): $A and $B: the same ids and the same logits bit for bit ($(($(wc -c < v4-a.f32) / 4)) values), $(chain_count deepseek_v4 v4-b.err) chain forwards"
 }
 v4_chain_gate() {
+  if [ "${EVICT:-0}" = 1 ]; then local -x COLI_VK_TIER_FILL=0; fi   # a budget that must evict: the history alone, no fill
   local tag=$1 fx=$2 c=$3; shift 3
   local p mt lg frames fault=()
   p=$(v4_chain_prompt "$fx" "$c")
@@ -2790,7 +2889,7 @@ v4_chain_san() {
   rm -f deepseek_v4_tiny_*/.coli_usage
   env COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "${fault[@]}" "$@" > san.log 2>&1 || true
   rm -f deepseek_v4_tiny_*/.coli_usage
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
   grep -q "deepseek_v4 chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
   echo "OK $tag: sanitizers clean, $(chain_count deepseek_v4 san.log) chain forwards$(grep -q 'the device was lost' san.log && echo ', the device lost')"
 }
@@ -2947,7 +3046,7 @@ family_deepseek_chain_sanitize() {
   make deepseek_v41 tests/test_vk_chain VK=1 EXTRA_CFLAGS="$SAN"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
   echo "OK asan: the chain's ops"
   v41_chain_fixtures
   export OMP_NUM_THREADS=2
@@ -2963,7 +3062,7 @@ family_deepseek_chain_sanitize() {
     fi
     rm -f chain.usage
     env COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "${fault[@]}" "$@" > san.log 2>&1 || true
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
     grep -q "deepseek_v41 chain: \([1-9][0-9]* forwards\|the device was lost\)" san.log || { cat san.log; fail "$tag: the chain never ran"; }
     echo "OK $tag: sanitizers clean, $(chain_count deepseek_v41 san.log) chain forwards"
   }
@@ -3035,9 +3134,9 @@ dho_gate() {
 # dho_lost <engine> <tag> <frames back> <env...> -- <argv...>: device only, the device lost
 # `back` frames before the end of a run (COLI_VK_CHAIN_FAULT, counted on a probe run): the
 # CPU's tokens, and the matrices the CPU then needed read back from disk.
-dho_lost() {
+dho_lost() {   # the host's routing, as lost_late (DMOE=1: the routed experts in the frame)
   local eng=$1 tag=$2 back=$3; shift 3
-  local envs=(); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
+  local envs=(COLI_VK_CHAIN_MOE=${DMOE:-0}); while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   local vk=(COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 COLI_VK_DENSE_HOST=0)
   rm -f chain.usage
   env "${envs[@]}" ./"$eng" "$@" > cpu.log 2>&1 || true
@@ -3070,7 +3169,7 @@ dho_rss_gate() {
   $PY - "$a" "$b" "$mib" <<'PY' || { grep '^\[VK\].*dense' host.log vk.log; fail "$tag: the resident set did not fall"; }
 import sys
 a, b, mib = float(sys.argv[1]), float(sys.argv[2]), float(sys.argv[3])
-print(f"RSS at exit {a:.2f} GiB with the host copies, {b:.2f} GiB on the device only")
+print(f"RSS at exit {a:.3f} GiB with the host copies, {b:.3f} GiB on the device only: {(a - b) * 1024:.1f} MiB less, {mib:.0f} wanted")
 sys.exit(0 if (a - b) * 1024 >= mib else 1)
 PY
   echo "OK $tag: $(grep -o 'given back.*' vk.log | head -1)"
@@ -3194,7 +3293,9 @@ done
 #   off       COLI_VK_CHAIN_ROWS=512 COLI_VK_TIER_STREAM=0 COLI_VK_ATTN_BLOCK=0, the
 #             build before's behaviour: the CPU's tokens, nothing streamed.
 # <family>-sanitize runs the forced configurations under ASan and UBSan.
-PF_FORCE="COLI_VK_TIER_STREAM_ROWS=3 COLI_VK_TIER_STREAM_SLOTS=4 COLI_VK_TIER_STREAM_HALF=24"
+# (COLI_VK_TIER_FILL=0: the warm start takes the history alone, or a fixture's experts would
+# all be resident and nothing would be cold enough to stream)
+PF_FORCE="COLI_VK_TIER_FILL=0 COLI_VK_TIER_STREAM_ROWS=3 COLI_VK_TIER_STREAM_SLOTS=4 COLI_VK_TIER_STREAM_HALF=24"
 PF_OFF="COLI_VK_CHAIN_ROWS=512 COLI_VK_TIER_STREAM=0 COLI_VK_ATTN_BLOCK=0"
 stream_count() {   # <engine> <log>: cold experts streamed in the run (the last report)
   local n; n=$(sed -n "s/^\[VK\] tier $1 run: .* stream: [0-9]* steps, \([0-9]*\) cold experts.*/\1/p" "$2" | tail -1)
@@ -3315,10 +3416,10 @@ family_prefill_qwen_sanitize() {
   make qwen36 qwen38 tests/test_vk_tier VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_vk_tier shaders/qmatmul.spv > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the tier"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the tier"; fi
   echo "OK asan: the tier, its streaming section included"
   COLI_VK_STAGED=1 ./tests/test_vk_tier shaders/qmatmul.spv > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the tier staged"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the tier staged"; fi
   echo "OK asan: the tier staged"
   $PY tools/make_qwen36_tiny.py --out qwen36_tiny --ref-mode full --emit-ref qwen36_tiny/ref_full.json
   $PY tools/convert_qwen36.py --model qwen36_tiny --out qwen36_tiny_c --ebits 8
@@ -3338,7 +3439,7 @@ pfsan() {
   rm -f chain.usage
   # shellcheck disable=SC2086
   env $PF_FORCE COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
   [ "$(chain_count "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the chain never ran"; }
   [ "$(stream_count "$eng" san.log)" -gt 0 ] || { grep '\[VK\]' san.log; fail "$tag: nothing streamed"; }
   echo "OK $tag: sanitizers clean, $(chain_count "$eng" san.log) chain forwards, $(stream_count "$eng" san.log) experts streamed"
@@ -3503,7 +3604,7 @@ kv_san() {
   local eng=$1 tag=$2; shift 2
   rm -f chain.usage
   env OMP_NUM_THREADS=2 COLI_USAGE=chain.usage COLI_VK_TIER_SYNC=1 COLI_VULKAN=1 COLI_VK_CHAIN=1 "$@" > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "$tag: sanitizer diagnostic"; fi
   [ "$(kv_hostparts "$eng" san.log)" -gt 0 ] || { cat san.log; fail "$tag: the split never ran a host part"; }
   kv_cold_check "$eng" "$tag" san.log
   echo "OK $tag: sanitizers clean, $(kv_hostparts "$eng" san.log) layer steps with a host part"
@@ -3553,7 +3654,7 @@ kv_split_qwen36_sanitize() {
   $PY -c "import sys; sys.path.insert(0, 'tests'); from prefix_serve_harness import ensure_byte_tokenizer as t; from pathlib import Path; t(Path('qwen36_tiny_c'))"
   CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
     $PY tests/vulkan_chain_serve.py ./qwen36 qwen36_tiny_c COLI_DENSE_I8=0 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 > san.log 2>&1 || { cat san.log; fail "asan kv qwen36 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv qwen36 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan kv qwen36 serve: sanitizer diagnostic"; fi
   echo "OK asan kv qwen36 serve: $(tail -1 san.log)"
 }
 
@@ -3612,7 +3713,7 @@ kv_split_qwen38_sanitize() {
   CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
     $PY tests/vulkan_chain_serve.py ./qwen38 qwen38_tiny_mtp Q38_MTP=1 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 \
     > san.log 2>&1 || { cat san.log; fail "asan kv qwen38 serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv qwen38 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan kv qwen38 serve: sanitizer diagnostic"; fi
   echo "OK asan kv qwen38 serve: $(tail -1 san.log)"
 }
 
@@ -3664,7 +3765,7 @@ kv_split_olmoe_sanitize() {
     SNAP=olmoe_tiny_c ./olmoe 2 8 $R
   CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
     $PY tests/vulkan_chain_serve.py ./olmoe olmoe_tiny_c COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 > san.log 2>&1 || { cat san.log; fail "asan kv olmoe serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv olmoe serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan kv olmoe serve: sanitizer diagnostic"; fi
   echo "OK asan kv olmoe serve: $(tail -1 san.log)"
 }
 
@@ -3757,7 +3858,7 @@ kv_split_inkling_sanitize() {
   CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' \
     $PY tests/vulkan_chain_serve.py ./inkling tiny_inkling INK_PREFIX_LOG=1 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 \
     > san.log 2>&1 || { cat san.log; fail "asan kv inkling serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv inkling serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan kv inkling serve: sanitizer diagnostic"; fi
   echo "OK asan kv inkling serve: $(tail -1 san.log)"
 }
 
@@ -3825,7 +3926,7 @@ kv_split_mimo_sanitize() {
   CHAIN_SERVE_EXPECT='KV split: [0-9]+ layer steps, [1-9][0-9]* with a host part' CHAIN_SERVE_TOL=1e-3 \
     $PY tests/vulkan_chain_serve.py ./mimo mimo_tiny_served OMP_NUM_THREADS=2 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 \
     > san.log 2>&1 || { cat san.log; fail "asan kv mimo serve"; }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv mimo serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan kv mimo serve: sanitizer diagnostic"; fi
   echo "OK asan kv mimo serve: $(tail -1 san.log)"
 }
 
@@ -3892,7 +3993,7 @@ kv_split_colibri_sanitize() {
       $PY tests/vulkan_chain_serve.py ./colibri glm_tiny_serve SERVE_BATCH=1 IDOT=0 KV_SLOTS=2 $K > san.log 2>&1 \
       || { cat san.log; fail "asan kv colibri serve"; }
   }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv colibri serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan kv colibri serve: sanitizer diagnostic"; fi
   echo "OK asan kv colibri serve: $(tail -1 san.log)"
   unset CAP_RAISE
 }
@@ -3946,7 +4047,7 @@ kv_split_glm53_sanitize() {
       $PY tests/vulkan_chain_serve.py ./glm53 glm53_serve GLM53_BITS=32 KV_SLOTS=2 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 > san.log 2>&1 \
       || { cat san.log; fail "asan kv glm53 serve"; }
   }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv glm53 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan kv glm53 serve: sanitizer diagnostic"; fi
   echo "OK asan kv glm53 serve: $(tail -1 san.log)"
 }
 
@@ -4009,7 +4110,7 @@ kv_split_kimi_sanitize() {
       $PY tests/vulkan_chain_serve.py ./kimi_k3 kimi_k3_serve K3_BITS=32 K3_MLA_BITS=32 K3_HEAD_BITS=32 K3_IDOT=0 K3_PREFIX_LOG=1 \
       USAGE_SAVE=0 COLI_K3_CKPT=4 COLI_VK_KV_DEVICE_ROWS=8 COLI_VK_KV_BLOCK=4 > san.log 2>&1 || { cat san.log; fail "asan kv kimi_k3 serve"; }
   }
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan kv kimi_k3 serve: sanitizer diagnostic"; fi
+  if san_diag san.log; then cat san.log; fail "asan kv kimi_k3 serve: sanitizer diagnostic"; fi
   echo "OK asan kv kimi_k3 serve: $(tail -1 san.log)"
 }
 
@@ -4161,7 +4262,7 @@ family_kv_split_sanitize() {
   make qwen36 qwen38 olmoe inkling mimo colibri glm53 kimi_k3 tests/test_vk_chain VK=1 EXTRA_CFLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g"
   export ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1
   ./tests/test_vk_chain shaders/qmatmul.spv > san.log 2>&1 || true
-  if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
+  if san_diag san.log || ! tail -1 san.log | grep -qx PASS; then cat san.log; fail "asan: the chain's ops"; fi
   echo "OK asan: the chain's ops, the split KV cache's among them"
   kv_split_qwen36_sanitize; kv_split_qwen38_sanitize; kv_split_olmoe_sanitize; kv_split_inkling_sanitize
   kv_split_mimo_sanitize; kv_split_colibri_sanitize; kv_split_glm53_sanitize; kv_split_kimi_sanitize
@@ -4289,7 +4390,7 @@ mux_gate() {  # <engine> <snapshot> <slots> <env...>
   if [ "${SAN:-0}" = 1 ]; then
     env "${mx[@]}" ASAN_OPTIONS=detect_leaks=0:detect_stack_use_after_return=0 UBSAN_OPTIONS=print_stacktrace=1 \
       $PY tests/serve_mux_check.py ./$eng $snap $n OMP_NUM_THREADS=2 "$@" > san.log 2>&1 || { cat san.log; fail "asan mux $eng $n $*"; }
-    if grep -qE "ERROR: AddressSanitizer|runtime error:" san.log; then cat san.log; fail "asan mux $eng $n $*: sanitizer diagnostic"; fi
+    if san_diag san.log; then cat san.log; fail "asan mux $eng $n $*: sanitizer diagnostic"; fi
     out=$(tail -1 san.log)
   else
     out=$(env "${mx[@]}" $PY tests/serve_mux_check.py ./$eng $snap $n "$@") || { echo "$out"; fail "mux $eng $n $*"; }

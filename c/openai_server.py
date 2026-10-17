@@ -162,11 +162,17 @@ def _engine_error(fields, message):
         else:
             limit = fields[2] if len(fields) > 2 else "the context"
             used = fields[1] if len(fields) > 1 else "?"
-        return APIError(400,
-                        f"This model's maximum context length is {limit} tokens, however your "
-                        f"messages resulted in at least {used} tokens. Please shorten the "
-                        f"conversation, or restart the server with a larger CTX.",
-                        "messages", "context_length_exceeded")
+        error = APIError(400,
+                         f"This model's maximum context length is {limit} tokens, however your "
+                         f"messages resulted in at least {used} tokens. Please shorten the "
+                         f"conversation, or restart the server with a larger CTX.",
+                         "messages", "context_length_exceeded")
+        # the numbers themselves, for context compaction (None when the frame had none)
+        try:
+            error.context = (int(used), int(limit))
+        except ValueError:
+            error.context = None
+        return error
     return RuntimeError(message)
 
 
@@ -431,6 +437,9 @@ def _fallback_tool_calls(tool_calls, index):
             except (json.JSONDecodeError, TypeError, ValueError):
                 raise APIError(400, "`function.arguments` must be a JSON object.",
                                f"messages.{index}.tool_calls.{position}.function.arguments")
+        if args and not isinstance(args, dict):
+            raise APIError(400, "`function.arguments` must be a JSON object.",
+                           f"messages.{index}.tool_calls.{position}.function.arguments")
         out.append(BOX_START + name)
         for key, value in (args or {}).items():
             rendered = value if isinstance(value, str) else json.dumps(
@@ -1296,8 +1305,12 @@ def decode_wav_mono16k(data, param):
     pos, fmt, raw = 12, None, None
     while pos + 8 <= len(data):
         cid, size = data[pos:pos + 4], _struct.unpack_from("<I", data, pos + 4)[0]
+        if pos + 8 + size > len(data):
+            raise APIError(400, "WAV file has a truncated chunk.", param, "invalid_value")
         body = data[pos + 8:pos + 8 + size]
         if cid == b"fmt ":
+            if len(body) < 16:
+                raise APIError(400, "WAV fmt chunk is too short.", param, "invalid_value")
             fmt = _struct.unpack_from("<HHIIHH", body, 0)
         elif cid == b"data":
             raw = body
@@ -1305,20 +1318,25 @@ def decode_wav_mono16k(data, param):
     if fmt is None or raw is None:
         raise APIError(400, "WAV file is missing fmt/data chunks.", param, "invalid_value")
     audio_format, channels, rate, _, _, bits = fmt
+    if channels == 0:
+        raise APIError(400, "WAV channel count must be positive.", param, "invalid_value")
     if audio_format == 0xFFFE:      # WAVE_FORMAT_EXTENSIBLE: trust the bit width
         audio_format = 3 if bits == 32 else 1
     if rate != AUDIO_SAMPLE_RATE:
         raise APIError(400, f"Audio must be {AUDIO_SAMPLE_RATE} Hz (got {rate}). "
                             "Resample at the capture edge.", param, "invalid_value")
     if audio_format == 1 and bits == 16:
+        if len(raw) % (channels * 2):
+            raise APIError(400, "WAV data must contain complete PCM16 frames.", param, "invalid_value")
         samples = np.frombuffer(raw, dtype="<i2").astype(np.float32) / 32768.0
     elif audio_format == 3 and bits == 32:
+        if len(raw) % (channels * 4):
+            raise APIError(400, "WAV data must contain complete float32 frames.", param, "invalid_value")
         samples = np.frombuffer(raw, dtype="<f4").astype(np.float32)
     else:
         raise APIError(400, f"Unsupported WAV encoding (format {audio_format}, {bits}-bit); "
                             "use PCM16 or float32.", param, "invalid_value")
     if channels > 1:
-        samples = samples[:len(samples) - len(samples) % channels]
         samples = samples.reshape(-1, channels).mean(axis=1)
     return samples
 
@@ -2132,10 +2150,43 @@ def render_chat_qwen3_coder(messages, tools=None, tool_choice=None, add_generati
 
 QWEN_CALL_RE = re.compile(
     r"<tool_call>\s*<function=([^>\n]+)>\s*(.*?)</function>\s*</tool_call>", re.S)
+QWEN_FUNCTION_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)</function>", re.S)
 QWEN_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
 
 
-def parse_qwen_tool_calls(reply, tools=None):
+def _qwen_argument(raw, declared):
+    """Restore declared JSON types, including the template's True/False/None.
+
+    This checks the declared top-level type, not every JSON Schema constraint.
+    An untyped parameter stays text, as it did before tool-call recovery.
+    """
+    kind = declared.get("type") if isinstance(declared, dict) else None
+    kinds = kind if isinstance(kind, list) else [kind]
+    if kind is None:
+        return raw
+    value = raw.strip()
+    if "null" in kinds and value in ("null", "None"):
+        return None
+    if "string" in kinds:
+        return raw
+    if "boolean" in kinds and value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    parsed = json.loads(raw)
+    numeric = type(parsed) in (int, float)
+    finite = numeric and (type(parsed) is int or math.isfinite(parsed))
+    if (("array" in kinds and isinstance(parsed, list)) or
+            ("object" in kinds and isinstance(parsed, dict)) or
+            ("boolean" in kinds and type(parsed) is bool) or
+            ("null" in kinds and parsed is None) or
+            ("number" in kinds and finite) or
+            ("integer" in kinds and finite and (type(parsed) is int or parsed.is_integer()))):
+        # NaN/Infinity can also occur inside containers; these are not JSON.
+        json.dumps(parsed, allow_nan=False)
+        return parsed
+    raise ValueError("tool parameter does not match its declared type")
+
+
+def parse_qwen_tool_calls(reply, tools=None, *, strip_text=True):
     """Parse Qwen's XML-ish calls back into OpenAI `tool_calls`.
 
     Values are returned as strings, which is what the template feeds in: it
@@ -2144,6 +2195,8 @@ def parse_qwen_tool_calls(reply, tools=None):
     re-read it as JSON, which restores numbers and booleans without guessing at
     anything the schema did not promise."""
     schema = {}
+    required = {}
+    closed = set()
     for tool in (tools or []):
         fn = tool.get("function", tool) if isinstance(tool, dict) else {}
         name = fn.get("name")
@@ -2151,24 +2204,27 @@ def parse_qwen_tool_calls(reply, tools=None):
         if isinstance(name, str) and name:
             if isinstance(params, dict):
                 schema[name] = params
+                required[name] = set((fn.get("parameters") or {}).get("required") or [])
+                if (fn.get("parameters") or {}).get("additionalProperties") is False:
+                    closed.add(name)
 
     def make_call(name, body):
+        if tools and name not in schema:
+            return None
         args = {}
+        if QWEN_PARAM_RE.sub("", body).strip():
+            return None
         for key, raw in QWEN_PARAM_RE.findall(body):
             key = key.strip()
+            if key in args or (name in closed and key not in schema[name]):
+                return None
             declared = (schema.get(name) or {}).get(key) or {}
-            kind = declared.get("type") if isinstance(declared, dict) else None
-            if kind in (None, "string"):
-                args[key] = raw
-            elif kind == "boolean" and raw.strip().lower() in ("true", "false"):
-                # The templates print a bool through jinja's `string`, so the model
-                # writes `True`; Qwen's own parser reads it case-insensitively.
-                args[key] = raw.strip().lower() == "true"
-            else:
-                try:
-                    args[key] = json.loads(raw)
-                except (TypeError, ValueError):
-                    args[key] = raw
+            try:
+                args[key] = _qwen_argument(raw, declared)
+            except (TypeError, ValueError):
+                return None
+        if required.get(name, set()) - set(args):
+            return None
         return {
             "id": f"call_{uuid.uuid4().hex[:24]}",
             "type": "function",
@@ -2178,12 +2234,33 @@ def parse_qwen_tool_calls(reply, tools=None):
             },
         }
 
+    reply = reply or ""
+    matches = list(QWEN_CALL_RE.finditer(reply))
+    recovered = False
+    if not matches and tools and "<tool_call>" not in reply:
+        # Some quantized checkpoints omit just the outer wrapper. Recover only a
+        # reply made entirely of complete function blocks: quoted examples or a
+        # marker mentioned in prose must never turn into an executable call.
+        inner = list(QWEN_FUNCTION_RE.finditer(reply))
+        if inner and not QWEN_FUNCTION_RE.sub("", reply).strip():
+            matches = inner
+            recovered = True
     calls = []
-    for match in QWEN_CALL_RE.finditer(reply or ""):
-        name = match.group(1).strip()
-        calls.append(make_call(name, match.group(2)))
-
-    text = QWEN_CALL_RE.sub("", reply or "")
+    text_parts = []
+    end = 0
+    for match in matches:
+        call = make_call(match.group(1).strip(), match.group(2))
+        if call is not None:
+            calls.append(call)
+            text_parts.append(reply[end:match.start()])
+            end = match.end()
+        elif recovered:
+            # Recover only when the entire bare reply is unambiguous and valid.
+            calls = []
+            text_parts = []
+            end = 0
+            break
+    text = "".join(text_parts) + reply[end:]
 
     if not calls and tools and (
         "<tool_call>" in (reply or "") or "<function=" in (reply or "")
@@ -2194,11 +2271,47 @@ def parse_qwen_tool_calls(reply, tools=None):
         )
         sys.stderr.flush()
 
-    return text.strip(), calls
+    return (text.strip() if strip_text else text), calls
 
 
 # Backward compatibility for existing Qwen3.8 callers.
 parse_qwen38_tool_calls = parse_qwen_tool_calls
+
+
+class QwenToolStream:
+    """Hold ambiguous tool syntax until the final parser accepts or releases it.
+
+    Prose before a marker streams immediately. Bare function blocks are only
+    calls if the complete reply contains nothing else, so their suffix cannot
+    be discarded merely because a marker appeared in one engine chunk.
+    """
+    def __init__(self, emit, tools):
+        self.emit = emit
+        self.tools = tools
+        self.parts = []
+        self.pending = ""
+        self.held = False
+        self.emitted = 0
+
+    def feed(self, text):
+        self.parts.append(text)
+        if self.held:
+            return
+        self.pending += text
+        markers = ("<tool_call>", "<function=")
+        positions = [self.pending.find(marker) for marker in markers]
+        hits = [position for position in positions if position >= 0]
+        self.held = bool(hits)
+        n = min(hits) if hits else max(0, len(self.pending) - max(map(len, markers)) + 1)
+        if n:
+            self.emit(self.pending[:n])
+            self.emitted += n
+            self.pending = self.pending[n:]
+
+    def finish(self):
+        text, calls = parse_qwen_tool_calls("".join(self.parts), self.tools, strip_text=False)
+        self.emit(text[self.emitted:])
+        return calls
 
 
 # ---- MiMo-V2.6 (Xiaomi) -------------------------------------------------------------------
@@ -2506,6 +2619,28 @@ def render_chat_qwen38(messages, enable_thinking=True, reasoning_effort=None, to
     return "".join(parts)
 
 
+def resends_reasoning(messages):
+    """Whether the client sent a past turn's reasoning back (`reasoning_content` on an
+    assistant message), as colibri's web does for a colibri server.
+
+    The engine's state holds that reasoning where the turn generated it. A history that
+    keeps it is that state token for token, so the next turn reuses it and reads only the
+    new text; a history that strips it diverges at the first past answer, and an engine
+    whose reuse is all or nothing (a recurrent or windowed state) reads the whole
+    conversation again, every turn. The renderers whose template drops past reasoning
+    by default keep it when this is true, in the form their template gives a kept turn."""
+    return isinstance(messages, list) and any(
+        isinstance(m, dict) and m.get("role") == "assistant"
+        and isinstance(m.get("reasoning_content"), str) and m["reasoning_content"].strip()
+        for m in messages)
+
+
+def preserve_thinking_default(messages, enable_thinking):
+    """Qwen3.6's preserve_thinking when the request does not set it: on with thinking off,
+    and on when the client sends the reasoning back (see the request handler)."""
+    return not enable_thinking or resends_reasoning(messages)
+
+
 def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, tools=None,
                         tool_choice=None, audio_out=None, add_generation_prompt=True):
     """Text-only subset of Inkling's chat_template.jinja: role tokens with
@@ -2568,6 +2703,16 @@ def render_chat_inkling(messages, enable_thinking=False, reasoning_effort=None, 
                                   + "<|audio|>" * val + "<|audio_end|><|end_message|>")
         else:
             text = content_text(raw, f"messages.{index}.content") if raw is not None else ""
+            reasoning = message.get("reasoning_content") if role == "assistant" else None
+            if reasoning is not None and not isinstance(reasoning, str):
+                raise APIError(400, "`reasoning_content` must be a string.",
+                               f"messages.{index}.reasoning_content")
+            # chat_template.jinja: a model turn's reasoning is a message of its own,
+            # <|message_model|><|content_thinking|>...<|end_message|>, before its text. That
+            # is also how the turn was generated, so a history that keeps it is the
+            # engine's state and the next turn reuses it (resends_reasoning).
+            if reasoning:
+                prompt.append(f"<|message_model|><|content_thinking|>{reasoning}<|end_message|>")
             # A continued turn is the last model message rendered open: no <|end_message|>.
             terminator = "" if open_turn else "<|end_message|>"
             prompt.append(f"{rtok}<|content_text|>{text}{terminator}")
@@ -3324,8 +3469,11 @@ def render_chat_dsv41(messages, enable_thinking=False, reasoning_effort=None, to
         if turn["role"] == "user" or (turn["role"] == "system" and index > 0):
             last_user = index
     # With tools on the table the reference keeps every turn's reasoning; without them it
-    # drops the reasoning of everything before the last user message.
-    drop_thinking = not tools
+    # drops the reasoning of everything before the last user message. A client that sends
+    # the reasoning back gets the kept form too: the engine holds those turns as they were
+    # generated, and with them stripped the next turn reads the whole conversation again
+    # (resends_reasoning).
+    drop_thinking = not tools and not resends_reasoning(messages)
     prompt = [DSV41_BOS]
     for index, turn in enumerate(turns):
         role = turn["role"]
@@ -3870,6 +4018,7 @@ GENERIC_JSON_GBNF = (
 )
 
 DEFAULT_CHAT_STOP_SEQUENCES = ("<|user|>", "<|observation|>")
+DEFAULT_QWEN36_CHAT_STOP_SEQUENCES = ("<|im_end|>", "<|im_start|>")
 
 # Seconds to wait for the engine to exit on its own after stdin EOF (its
 # atexit teardown writes HEAT_FILE). EOF is only observed between turns,
@@ -3929,6 +4078,179 @@ def conversation_cache_slot(messages, kv_slots):
     return int.from_bytes(digest[:8], "big") % kv_slots
 
 
+# ---- context compaction -------------------------------------------------------------------
+# A chat that outgrows the engine's context used to end in a 400 the user could do nothing
+# with but start over. A request that asks for it (`context_compaction: "auto"`, which the
+# dashboard and `coli chat` send) is compacted instead: the oldest turns are summarized by
+# the model itself, the summary joins the system message, and the turn runs on the summary
+# plus the last exchanges, which stay verbatim.
+#
+# The server keeps the summaries, keyed by the conversation prefix each one replaces. The
+# client keeps sending its whole history, as the API is stateless; every later turn finds
+# its summary here and renders the same compacted prompt, so the engine's prefix reuse works
+# across turns exactly as before. A restarted server summarizes once more.
+#
+# The summary is asked for at the end of the conversation the engine already holds (the
+# history before the new message, then the request to summarize), so the engine prefills
+# only the request: the state is the one the previous turn left.
+
+COMPACT_NOTE = ("Summary of the earlier part of this conversation (its messages were removed "
+                "to fit the context window):\n\n")
+COMPACT_ASK = ("Summarize our conversation so far so that it can continue from your summary "
+               "alone. Keep everything still needed: what I asked for and want, facts, names, "
+               "numbers, decisions, code and file names, and open questions. Write it in the "
+               "language of the conversation, in at most {words} words, and reply with the "
+               "summary only.")
+# What a kept tail may take of the context: the summary and the room to answer take the rest,
+# so the next compaction is many turns away.
+COMPACT_KEEP_SHARE = 0.25
+# Tokens per character before the server has measured any (UTF-8 prose runs near 0.25-0.3)
+COMPACT_DEFAULT_RATIO = 0.35
+COMPACT_IMAGE_TOKENS = 768
+
+
+def compaction_requested(body):
+    """True when the request opts into context compaction; COLI_COMPACT=1 makes it the default."""
+    value = body.get("context_compaction")
+    if value is None:
+        return os.environ.get("COLI_COMPACT", "0") == "1"
+    if value not in ("auto", "off", True, False):
+        raise APIError(400, "`context_compaction` must be \"auto\" or \"off\".", "context_compaction")
+    return value in ("auto", True)
+
+
+def _message_canon(message):
+    try:
+        return json.dumps(message, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return repr(message)
+
+
+def compaction_keys(lead, conversation):
+    """keys[k] names the conversation's first k messages after its leading system messages."""
+    digest = hashlib.sha256(_message_canon(lead).encode("utf-8", "replace")).digest()
+    keys = [digest]
+    for message in conversation:
+        digest = hashlib.sha256(digest + _message_canon(message).encode("utf-8", "replace")).digest()
+        keys.append(digest)
+    return keys
+
+
+def split_lead(messages):
+    """(the leading system/developer messages, the rest)"""
+    n = 0
+    while n < len(messages) and isinstance(messages[n], dict) and \
+            messages[n].get("role") in ("system", "developer"):
+        n += 1
+    return list(messages[:n]), list(messages[n:])
+
+
+def with_summary(lead, summary):
+    """The leading messages with the summary appended to the system message (or as one)."""
+    if summary is None:
+        return list(lead)
+    note = COMPACT_NOTE + summary.strip()
+    if lead and lead[0].get("role") == "system":
+        first = dict(lead[0])
+        content = first.get("content")
+        if isinstance(content, list):
+            first["content"] = list(content) + [{"type": "text", "text": "\n\n" + note}]
+        elif isinstance(content, str) and content.strip():
+            first["content"] = content.rstrip() + "\n\n" + note
+        else:
+            first["content"] = note
+        return [first] + list(lead[1:])
+    return [{"role": "system", "content": note}] + list(lead)
+
+
+def without_images(message):
+    """The message with its pictures as a mark: the summary reads text, and the engine
+    takes one picture per request."""
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    parts, changed = [], False
+    for part in content:
+        if isinstance(part, dict) and part.get("type") not in ("text", "input_text"):
+            parts.append({"type": "text", "text": "[image]"})
+            changed = True
+        else:
+            parts.append(part)
+    return dict(message, content=parts) if changed else message
+
+
+def estimate_message_tokens(message, ratio):
+    content = message.get("content")
+    chars, images = 0, 0
+    if isinstance(content, str):
+        chars = len(content)
+    elif isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
+                chars += len(str(part.get("text") or ""))
+            elif isinstance(part, dict):
+                images += 1
+    for key in ("reasoning_content", "tool_calls"):
+        if message.get(key):
+            chars += len(_message_canon(message[key]))
+    return int(chars * ratio) + 8 + images * COMPACT_IMAGE_TOKENS
+
+
+def compaction_tail_start(conversation, done, ratio, keep_tokens):
+    """Where the verbatim tail begins: the earliest user turn after `done` whose tail fits
+    `keep_tokens`, and never later than the last user turn (the new request). None when
+    nothing before that turn is left to summarize."""
+    users = [i for i in range(done, len(conversation))
+             if isinstance(conversation[i], dict) and conversation[i].get("role") == "user"]
+    if not users:
+        return None
+    start = users[-1]
+    for i in reversed(users[:-1]):
+        if i <= done:
+            break
+        if sum(estimate_message_tokens(m, ratio) for m in conversation[i:]) > keep_tokens:
+            break
+        start = i
+    return start if start > done else None
+
+
+def close_open_thinking(prompt):
+    """A prompt that opens the model's reasoning block, closed: the summary is written
+    without thinking, after the same prefix the conversation was rendered with.
+    Returns (prompt, whether it closed one)."""
+    if prompt.endswith(THINK_OPEN + "\n"):
+        return prompt + "\n" + THINK_CLOSE + "\n\n", True
+    if prompt.endswith(THINK_OPEN):
+        return prompt + THINK_CLOSE, True
+    return prompt, False
+
+
+class CompactionMemory:
+    """The summaries this server wrote, by the conversation prefix each one replaces."""
+
+    def __init__(self, capacity=256):
+        self.capacity = capacity
+        self._items = collections.OrderedDict()
+        self._lock = threading.Lock()
+
+    def find(self, keys):
+        """(k, summary) for the longest remembered prefix, (0, None) for none."""
+        with self._lock:
+            for k in range(len(keys) - 1, 0, -1):
+                summary = self._items.get(keys[k])
+                if summary is not None:
+                    self._items.move_to_end(keys[k])
+                    return k, summary
+        return 0, None
+
+    def remember(self, key, summary):
+        with self._lock:
+            self._items[key] = summary
+            self._items.move_to_end(key)
+            while len(self._items) > self.capacity:
+                self._items.popitem(last=False)
+
+
 def stop_policy(body, chat):
     sequences = parse_stop_sequences(body)
     ignore_leading = body.get("x_colibri_ignore_leading_stop", False)
@@ -3942,6 +4264,12 @@ def stop_policy(body, chat):
         # occasional leading GLM marker patiently; client-provided stops remain
         # strict unless the extension is explicitly requested.
         return DEFAULT_CHAT_STOP_SEQUENCES, True
+    if chat and ARCH == "qwen36" and not sequences:
+        # KAT normally ends with the special im_end token, which the native
+        # engine handles by token id. Quantized checkpoints can instead spell
+        # the marker as ordinary text pieces. Keep that template boundary out
+        # of OpenAI responses without overriding an explicit client stop.
+        return DEFAULT_QWEN36_CHAT_STOP_SEQUENCES, ignore_leading
     return sequences, ignore_leading
 
 
@@ -4059,7 +4387,9 @@ def validate_tools(body):
     iterate the list and parse_tool_calls reads each schema's `properties` and `required`, so
     this has to run before either: chat_completion() calls it ahead of rendering, and
     generation_options() calls it again for every other path."""
-    tools_raw = body.get("tools") or body.get("functions")
+    tools_raw = body.get("tools")
+    if tools_raw is None or (isinstance(tools_raw, list) and not tools_raw):
+        tools_raw = body.get("functions")
     if tools_raw is not None:
         if not isinstance(tools_raw, list):
             raise APIError(400, "`tools` must be a non-empty array.", "tools", "invalid_value")
@@ -4091,12 +4421,21 @@ def validate_tools(body):
             if params.get("required") is not None and not isinstance(params["required"], list):
                 raise APIError(400, f"Tool `parameters.required` must be an array at index {idx}.",
                                f"tools.{idx}.function.parameters.required", "invalid_value")
+            for position, name in enumerate(params.get("required") or []):
+                if not isinstance(name, str):
+                    raise APIError(400, "Tool `parameters.required` entries must be strings.",
+                                   f"tools.{idx}.function.parameters.required.{position}", "invalid_value")
 
 
 def generation_options(body, limit):
-    if body.get("n", 1) != 1:
+    n = body.get("n", 1)
+    if isinstance(n, bool) or not isinstance(n, int):
+        raise APIError(400, "`n` must be an integer.", "n", "invalid_value")
+    if n != 1:
         raise APIError(400, "Colibri currently supports `n=1` only.", "n", "unsupported_value")
     best_of = body.get("best_of", 1)
+    if best_of is not None and (isinstance(best_of, bool) or not isinstance(best_of, int)):
+        raise APIError(400, "`best_of` must be an integer.", "best_of", "invalid_value")
     if best_of not in (None, 1):
         raise APIError(400, "Colibri currently supports `best_of` equal to 1 only.",
                        "best_of", "unsupported_value")
@@ -4210,10 +4549,10 @@ def generation_options(body, limit):
         maximum = limit   # clamp to the server's --max-tokens cap instead of 400 (#260): OpenAI
                           # clients (opencode/ai-sdk) default to large max_tokens; rejecting breaks them.
     if (isinstance(temperature, bool) or not isinstance(temperature, (int, float)) or
-            not math.isfinite(temperature) or not 0 <= temperature <= 2):
+            not 0 <= temperature <= 2 or not math.isfinite(temperature)):
         raise APIError(400, "`temperature` must be between 0 and 2.", "temperature")
     if (isinstance(top_p, bool) or not isinstance(top_p, (int, float)) or
-            not math.isfinite(top_p) or not 0 < top_p <= 1):
+            not 0 < top_p <= 1 or not math.isfinite(top_p)):
         raise APIError(400, "`top_p` must be greater than 0 and at most 1.", "top_p")
     return maximum, float(temperature), float(top_p), grammar, stop_sequences
 
@@ -4723,17 +5062,28 @@ def _engine_extension_args(engine_k):
     return {"logprobs": engine_k, "gbytes_before_ext": True}
 
 
+# An instruction the processor does not have: SIGILL on POSIX, STATUS_ILLEGAL_INSTRUCTION on
+# Windows. An engine built for x86-64-v3 dies this way on a processor without AVX2 (#1979).
+ILLEGAL_INSTRUCTION = "an instruction this processor does not have, such as AVX2"
+
+
 def engine_exit_status(status):
     """A child's exit status in words: a signal on POSIX (a SIGKILL is most often the
     out-of-memory killer), the NTSTATUS on Windows."""
     if status < 0:
-        name = {9: "SIGKILL, most often the out-of-memory killer", 11: "SIGSEGV", 6: "SIGABRT"}.get(-status)
+        name = {9: "SIGKILL, most often the out-of-memory killer", 11: "SIGSEGV", 6: "SIGABRT",
+                4: f"SIGILL, {ILLEGAL_INSTRUCTION}"}.get(-status)
         return f"killed by signal {-status}" + (f", {name}" if name else "")
     if status >= 0xC0000000:
         name = {0xC0000005: "access violation", 0xC0000017: "out of memory", 0xC00000FD: "stack overflow",
-                0xC0000409: "fail-fast or stack buffer overrun"}.get(status)
+                0xC0000409: "fail-fast or stack buffer overrun",
+                0xC000001D: f"illegal instruction, {ILLEGAL_INSTRUCTION}"}.get(status)
         return f"exit status 0x{status:08X}" + (f", {name}" if name else "")
     return f"exit status {status}"
+
+
+def engine_illegal_instruction(status):
+    return status == -4 or status == 0xC000001D
 
 
 class EngineLoadError(RuntimeError):
@@ -4760,6 +5110,21 @@ def parse_load_fail(data):
         if len(fields) >= 2 and fields[0] == "LOAD_FAIL" and fields[1].startswith("kind="):
             found = (fields[1][len("kind="):], fields[2] if len(fields) > 2 else "")
     return found
+
+
+def _cluster_stats(fields):
+    """The summary a coordinator with CLUSTER_WORKERS appends to its STAT line, as
+    key=value after length_limited -- per emitted token, in the shape distributed-llama
+    prints per token: cluster_g_ms (the whole decode step), cluster_i_ms (local
+    inference), cluster_t_ms (time on the wire), cluster_tx_kb / cluster_rx_kb (bytes
+    each way). Absent without a cluster; a bare positional tail has no '=' and is
+    left alone."""
+    out = {}
+    for entry in fields[7:]:
+        key, sep, value = entry.partition("=")
+        if sep and key.startswith("cluster_"):
+            out[key] = float(value)
+    return out
 
 
 def read_engine_turn(stream, sentinel, on_bytes, caps=None):
@@ -4802,12 +5167,26 @@ def read_engine_turn(stream, sentinel, on_bytes, caps=None):
         "rss_gb": float(fields[4]),
         "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
         "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+        **_cluster_stats(fields),
     }
 
 
 def model_arch(model):
     """Compatibility wrapper over the mandatory family registry."""
     return resolve_model(model).descriptor.id
+
+
+def _route_top_k(model):
+    """num_experts_per_tok of a model directory's config.json (its text_config first), 0 when unknown."""
+    try:
+        cfg = json.loads((Path(model) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return 0
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else {}
+    try:
+        return max(0, int(text.get("num_experts_per_tok") or cfg.get("num_experts_per_tok") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def cap_for_arch(arch, cap, env=None, model=None):
@@ -4849,24 +5228,71 @@ def cap_for_arch(arch, cap, env=None, model=None):
             planned = 0
         if planned >= 1:
             return planned
-    if arch in ("deepseek_v41", "mimo") and model is not None:
-        # V4.1 and MiMo only read their argv cap, not RAM_GB. Without --auto-tier the
-        # legacy eight slots silently discarded both --ram and RAM_GB (#1666).
+    if arch in ("deepseek_v41", "mimo", "qwen36", "qwen38") and model is not None:
+        # V4.1, MiMo, Qwen3.6 and Qwen3.8 only read their argv cap, not RAM_GB.
+        # Without --auto-tier the legacy eight slots silently discarded both --ram
+        # and RAM_GB (#1666), and Qwen3.8's implicit one slot, Qwen3.6's eight, left
+        # a `coli web` or `coli serve` without --cap or a tune profile reading
+        # nearly every expert from the disk: the setup passes --auto-tier only
+        # for CUDA. Qwen3.8 on a 61 GB box planned 275 slots and started at 1;
+        # Qwen3.6 plans 153 at 20 GB, and coli tune measured 105 on a 32 GB laptop.
         from resource_plan import build_plan
         settings = env if env is not None else os.environ
         ram = settings.get("RAM_GB", "0")
         limits = family_by_id(arch).limits
-        plan = build_plan(model, ram_gb=0 if ram == "auto" else float(ram),
-                          context=int(settings.get(limits.context_env, limits.default_context)),
-                          gpu_indices=[])
-        slots = plan["tiers"]["ram"]["cache_slots_per_layer"]
-        if slots < 1:
+        try:
+            plan = build_plan(model, ram_gb=0 if ram == "auto" else float(ram),
+                              context=int(settings.get(limits.context_env, limits.default_context)),
+                              gpu_indices=[])
+            slots = plan["tiers"]["ram"]["cache_slots_per_layer"]
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            if arch in ("deepseek_v41", "mimo"):
+                raise
+            # The Qwen engines ran on their implicit cap before the plan was
+            # applied: a model the planner cannot read still starts as before,
+            # with at least one token's route (top-k) in the cache.
+            floor = max(limits.implicit_cap, _route_top_k(model))
+            print(f"[{arch}] no RAM plan ({error}); {floor} expert cache "
+                  f"slots/layer, --cap or coli tune sets more", file=sys.stderr)
+            return floor
+        # A Qwen cache below one token's route (top-k) reads that token's experts
+        # from the disk at every step: Qwen3.8's implicit cap is 1 and its route
+        # 10, and a Windows box whose free RAM made the plan come out empty
+        # decoded at 0.03 tok/s while the engine measured room for 99 (#2031).
+        floor = max(limits.implicit_cap, _route_top_k(model)) if arch in ("qwen36", "qwen38") else 1
+        if slots < floor:
+            if arch in ("qwen36", "qwen38"):
+                print(f"[{arch}] RAM plan: {max(slots, 0)} expert cache slots/layer, below one "
+                      f"token's route; starting at {floor} (--cap or --ram sets more)", file=sys.stderr)
+                return floor
             raise ValueError(f"{family_by_id(arch).display_name} RAM budget cannot hold one "
                              f"expert slot per layer")
         print(f"[{'v41' if arch == 'deepseek_v41' else arch}] RAM plan: {slots} expert cache "
               f"slots/layer; --cap overrides", file=sys.stderr)
         return slots
     return family_by_id(arch).limits.implicit_cap
+
+
+def chat_context_env(env, family, model, kv_slots=1):
+    """The family's context variable, set from the memory there is when nobody set it
+    (resource_plan.chat_context: a chat outgrew the families' 4096-8192 in a few long
+    answers); returns the context the engine will hold, None when it cannot be told."""
+    limits = family.limits
+    if family.modality != "text" or not limits.context_env:
+        return None
+    try:
+        from resource_plan import chat_context
+        context, why = chat_context(model, env, kv_slots)
+    except Exception:                  # a synthetic model, an unreadable config: the default
+        context, why = None, None
+    if context:
+        env[limits.context_env] = str(context)
+        print(f"[gateway] {why}", file=sys.stderr)
+    try:
+        from family_registry import default_context
+        return int(env.get(limits.context_env) or default_context(resolve_model(model)))
+    except Exception:
+        return None
 
 
 def decision_head_env(env, model):
@@ -5270,6 +5696,16 @@ class Engine:
                          NGEN=str(max_tokens), KV_SLOTS=str(kv_slots))
         tune_child_env(child_env, arch)
         decision_head_env(child_env, model)
+        # before the cap: the RAM plan reserves the context it is given
+        self.context_limit = chat_context_env(child_env, family, model, kv_slots)
+        # No ceiling from the operator (0): the context the engine holds is the ceiling. A
+        # reasoning model's turn is its reasoning plus its answer, and any fixed number
+        # below the context cut some of them short (#382); the engines stop at the end of
+        # the context on their own, so a turn ends when the model closes it or there.
+        if not max_tokens:
+            max_tokens = self.context_limit or family.limits.interactive_max_output
+            child_env["NGEN"] = str(max_tokens)
+        self.max_tokens = max_tokens
         resolved_cap = cap_for_arch(arch, cap, child_env, model=model)
         child_env.pop("COLI_PROFILE_CAP", None)
         child_env.pop("COLI_PLAN_CAP", None)
@@ -5315,10 +5751,25 @@ class Engine:
             del boot[:-4096]
         try:
             read_engine_turn(self.process.stdout, READY, keep, self.caps)
-        except RuntimeError:
+        except RuntimeError as error:
             failure = parse_load_fail(bytes(boot))
             if failure is not None:
                 raise EngineLoadError(*failure) from None
+            # No LOAD_FAIL: the exit status is the only cause left to name. An engine
+            # that predates the processor check (cpu_check.h) dies on the first
+            # instruction its processor lacks, right after its banner (#1979).
+            try:
+                status = self.process.wait(timeout=2)
+            except Exception:
+                status = None
+            if status is not None and engine_illegal_instruction(status):
+                raise EngineLoadError(
+                    "unsupported", f"the engine stopped on {ILLEGAL_INSTRUCTION} "
+                    f"({engine_exit_status(status)}): it was built for a newer processor; "
+                    "build the engines for this one with ARCH=x86-64-v2 "
+                    "(docs/quickstart.md, \"Old processors\")") from None
+            if status is not None:
+                raise RuntimeError(f"{error} ({engine_exit_status(status)})") from None
             raise
         # True/False when the engine said whether it loaded a vision tower; None when
         # it said nothing (an engine that predates CAPS, or a family without a tower).
@@ -5347,6 +5798,7 @@ class Engine:
             "rss_gb": float(fields[4]),
             "prompt_tokens": int(fields[5]) if len(fields) > 5 else 0,
             "length_limited": bool(int(fields[6])) if len(fields) > 6 else False,
+            **_cluster_stats(fields),
         }
 
     def _fail_pending(self, error):
@@ -5606,7 +6058,7 @@ class Engine:
                     self.hits_seq += 1
                 elif kind == "PROF" and len(fields) >= 10:
                     # per-turn phase timings: where the engine spent this turn's wall time
-                    self.profile.append({
+                    turn = {
                         "wall_s": float(fields[1]),
                         "prompt_tokens": int(fields[2]),
                         "completion_tokens": int(fields[3]),
@@ -5616,7 +6068,13 @@ class Engine:
                         "attention_s": float(fields[7]),
                         "lm_head_s": float(fields[8]),
                         "forwards": int(fields[9]),
-                    })
+                    }
+                    if len(fields) >= 13:
+                        # CLUSTER_WORKERS: the coordinator's time on the wire, bytes each way
+                        turn["cluster_transfer_s"] = float(fields[10])
+                        turn["cluster_tx_bytes"] = int(fields[11])
+                        turn["cluster_rx_bytes"] = int(fields[12])
+                    self.profile.append(turn)
                     self.profile_seq += 1
                 elif kind == "TIERS" and len(fields) >= 6:
                     self.tiers = {"vram": int(fields[1]), "ram": int(fields[2]),
@@ -6086,6 +6544,11 @@ class APIServer(ThreadingHTTPServer):
         self._conn_live = 0
         self._conn_by_ip = {}
         self._conn_owner = {}
+        # context compaction: the summaries written, the context ceiling (the engine's,
+        # then the one its errors report) and the measured tokens per prompt character
+        self.compactions = CompactionMemory()
+        self.context_limit = None
+        self.tokens_per_char = None
 
     def model_entry(self):
         """The /v1/models object. An image model says so, and carries the size
@@ -6094,6 +6557,12 @@ class APIServer(ThreadingHTTPServer):
         entry = model_object(self.model_id, self.created)
         entry["input_modalities"] = self.input_modalities()
         entry["capabilities"] = self.capabilities()
+        limit = getattr(self, "context_limit", None)
+        if limit and "chat" in entry["capabilities"]:
+            # The context the engine holds, by the names agents look for (Hermes Agent,
+            # vLLM and LiteLLM clients). Without it they assume a window the engine does
+            # not have (Hermes: 128k), compact too late and end in context_length_exceeded.
+            entry["context_length"] = entry["max_model_len"] = int(limit)
         if is_image_engine(self.engine):
             info = getattr(self.engine, "info", None) or {}
             entry["image"] = {key: info.get(key) for key in IMAGE_OPTION_KEYS}
@@ -6160,10 +6629,25 @@ class APIServer(ThreadingHTTPServer):
         if kwargs.get("on_tool") is not None:
             kwargs["on_tool"] = measured(kwargs["on_tool"])
         try:
-            return self.engine.generate(prompt, max_tokens, temperature, top_p,
-                                        measured(on_text), *args, **kwargs)
+            stats = self.engine.generate(prompt, max_tokens, temperature, top_p,
+                                         measured(on_text), *args, **kwargs)
         finally:
             self.scheduler.observe_timing("engine_call_seconds", time.monotonic() - started)
+        self.note_prompt_size(prompt, stats, kwargs.get("image") is not None)
+        return stats
+
+    def note_prompt_size(self, prompt, stats, image=False):
+        """Tokens per prompt character, measured on the prompts served (a picture's
+        tokens have no characters, so those are left out)."""
+        try:
+            tokens = int(stats.get("prompt_tokens") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if image or not isinstance(prompt, str) or len(prompt) < 256 or tokens < 1:
+            return
+        ratio = tokens / len(prompt)
+        self.tokens_per_char = (ratio if self.tokens_per_char is None
+                                else 0.7 * self.tokens_per_char + 0.3 * ratio)
 
     def process_request(self, request, client_address):
         """Refuse past the caps instead of spawning an unbounded thread."""
@@ -6513,6 +6997,10 @@ class APIHandler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise APIError(400, "Request body must be valid JSON.")
+        except (ValueError, RecursionError):
+            # The runtime's integer and nesting guards reject client data,
+            # before an engine has received any request.
+            raise APIError(400, "Request body exceeds the supported JSON parsing limits.")
         try:
             # An escaped lone surrogate ("\ud83d") parses, but it is the same invalid
             # text as the undecodable bytes above: no UTF-8 can carry it, and the
@@ -6521,6 +7009,8 @@ class APIHandler(BaseHTTPRequestHandler):
         except UnicodeEncodeError:
             raise APIError(400, "Request body contains an unpaired UTF-16 surrogate "
                                 "escape; strings must be valid Unicode.")
+        except RecursionError:
+            raise APIError(400, "Request body exceeds the supported JSON parsing limits.")
         if not isinstance(body, dict):
             raise APIError(400, "Request body must be a JSON object.")
         return body
@@ -6584,6 +7074,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
                 self.send_header("Content-Length", str(len(data)))
                 self.send_header("Cache-Control", "no-store")
+                self.send_cors_headers()
                 self.end_headers()
                 self.wfile.write(data)
                 return
@@ -6598,6 +7089,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     payload["kv_slots"] = self.server.kv_slots
                     payload["input_modalities"] = self.server.input_modalities()
                     payload["continue_assistant"] = os.environ.get("COLI_CONTINUE_ASSISTANT", "1") != "0" and ARCH in CONTINUATION_FAMILIES
+                    # chat requests may send context_compaction; the context they fit in
+                    payload["context_compaction"] = True
+                    if getattr(self.server, "context_limit", None):
+                        payload["context_tokens"] = self.server.context_limit
+                    # the response ceiling a request is lowered to: a client's default
+                    payload["max_tokens"] = self.server.max_tokens
                     tiers = getattr(self.server.engine, "tiers", None) if self.server.engine else None
                     if tiers: payload["tiers"] = tiers
                     hwinfo = getattr(self.server.engine, "hwinfo", None) if self.server.engine else None
@@ -6806,13 +7303,13 @@ class APIHandler(BaseHTTPRequestHandler):
                         raise ClientCancelled()
                     _, tail = score(prefix + " " + option, False)
                     rows = [e for e in tail if e["pos"] >= n_prefix and e["logprob"] is not None]
+                    if not rows:
+                        raise APIError(502, "The engine returned no log probabilities for an "
+                                            "option.", None, "engine_error", "server_error")
                     total = sum(e["logprob"] for e in rows)
                     count = max(len(rows), 1)
                     scored.append({"option": option, "logprob": total, "tokens": len(rows),
                                    "mean_logprob": total / count})
-                if not any(entry["tokens"] for entry in scored):
-                    raise APIError(502, "The engine returned no log probabilities for the "
-                                        "options.", None, "engine_error", "server_error")
                 key = "mean_logprob" if norm == "mean" else "logprob"
                 if norm == "mean":
                     token_counts = {entry["tokens"] for entry in scored if entry["tokens"]}
@@ -7105,8 +7602,12 @@ class APIHandler(BaseHTTPRequestHandler):
         for (qid, kind, _, _, levels), question, answer in zip(plan, record["questions"], got):
             probs = answer.get("probs") if isinstance(answer, dict) else None
             n = len(question["options"])
-            if (answer.get("id") != qid or not isinstance(probs, list) or len(probs) != n or
-                    not all(isinstance(p, (int, float)) and math.isfinite(p) for p in probs)):
+            if (not isinstance(answer, dict) or answer.get("id") != qid or
+                    not isinstance(probs, list) or len(probs) != n or
+                    not all(type(p) in (int, float) and math.isfinite(p) and 0 <= p <= 1
+                            for p in probs) or
+                    # decide_serve.h writes nine significant digits on the wire.
+                    not math.isclose(math.fsum(probs), 1.0, rel_tol=0.0, abs_tol=1e-6)):
                 raise APIError(502, f"The decision engine sent no usable probabilities for `{qid}`.",
                                None, "engine_error", "server_error")
             best = max(range(n), key=lambda i: (probs[i], -i))
@@ -7344,7 +7845,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
     def generation(self, body, prompt, request_id, chat, tools=None, tool_choice=None,
                    enable_thinking=False, audio=None, image=None,
-                   add_generation_prompt=True):
+                   add_generation_prompt=True, compaction=None):
         # COLI_DEBUG tees the engine transaction to stderr: 1 = decoded output stream only,
         # 2 = both sides (rendered prompt + output). render_chat already folds prior turns and
         # tool results into `prompt`, so level 2 is the full conversation the engine saw.
@@ -7404,6 +7905,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 contextlib.ExitStack() as stream_cleanup:
             queue_wait, cache_slot = admission
             queue_headers = {"x-colibri-queue-wait-ms": str(round(queue_wait * 1000))}
+            if compaction:
+                # the conversation ran on a summary of its first messages (context_compaction)
+                queue_headers["x-colibri-compacted-messages"] = str(compaction["summarized_messages"])
             if not stream:
                 output = []
                 stop_filter = StopFilter(stop_sequences, output.append, ignore_leading_stop,
@@ -7494,9 +7998,11 @@ class APIHandler(BaseHTTPRequestHandler):
                                "logprobs": logprobs_obj, "finish_reason": length_finish} if chat else
                               {"index": 0, "text": text, "logprobs": logprobs_obj,
                                "finish_reason": length_finish})
-                self.send_json(200, {"id": completion_id, "object": object_name, "created": created,
-                    "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)},
-                    request_id, queue_headers)
+                reply = {"id": completion_id, "object": object_name, "created": created,
+                         "model": self.server.model_id, "choices": [choice], "usage": self.usage(stats)}
+                if compaction:
+                    reply["compaction"] = compaction
+                self.send_json(200, reply, request_id, queue_headers)
                 return
 
             stream_object = "chat.completion.chunk" if chat else object_name
@@ -7594,6 +8100,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 if chat:
                     event([{"index": 0, "delta": {"role": "assistant", "content": ""},
                             "logprobs": None, "finish_reason": None}])
+                if compaction:
+                    # before any text, so a client can say why the model's view is shorter
+                    data = json.dumps({"id": completion_id, "object": stream_object,
+                                       "created": created, "model": self.server.model_id,
+                                       "choices": [], "compaction": compaction},
+                                      ensure_ascii=False, separators=(",", ":"))
+                    with ka_lock:
+                        try:
+                            self.wfile.write(f"data: {data}\n\n".encode())
+                            self.wfile.flush()
+                        except OSError:
+                            connected = False
                 ka_thread[0] = threading.Thread(target=_keepalive, daemon=True)
                 ka_thread[0].start()
                 stream_cleanup.callback(ka_thread[0].join, timeout=2)
@@ -7607,9 +8125,14 @@ class APIHandler(BaseHTTPRequestHandler):
                 raw = []
                 sideband = ToolSideband(ARCH == "kimi", stop_sequences,
                                         ignore_leading_stop)
+                qwen_stream = (QwenToolStream(emit, tools) if chat_flavor() in
+                               ("qwen36", "qwen38", "qwen3_coder") else None)
 
                 def feed_content(chunk):               # answer text only (post-</think>)
                     raw.append(chunk)
+                    if qwen_stream is not None:
+                        qwen_stream.feed(chunk)
+                        return
                     if sideband.seen:
                         emit(chunk)
                         return
@@ -7653,10 +8176,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 sideband.finish()
                 if think:
                     think.finish()
-                if not sp["tool"] and sp["buf"]:
-                    emit(sp["buf"])                     # no tool call happened: flush held tail
-                _content, calls = parse_arch_tool_calls("".join(raw), tools,
-                                                        sideband.reply())
+                if qwen_stream is not None:
+                    calls = qwen_stream.finish()
+                else:
+                    if not sp["tool"] and sp["buf"]:
+                        emit(sp["buf"])                 # no tool call happened: flush held tail
+                    _content, calls = parse_arch_tool_calls("".join(raw), tools,
+                                                            sideband.reply())
                 for i, tc in enumerate(calls):
                     event([{"index": 0, "delta": {"tool_calls": [{"index": i, "id": tc["id"],
                              "type": "function", "function": {"name": tc["function"]["name"],
@@ -7768,12 +8294,15 @@ class APIHandler(BaseHTTPRequestHandler):
             # true end-to-end instead of trusting every path to opt out.
             enable_thinking = False
         # Qwen3.6's preserve_thinking (#1759), under the name Qwen's own API gives it. Off
-        # by default with thinking on: a standard client does not send the reasoning back,
-        # and the block would come back empty where the model did think. On by default with
-        # thinking off: there the block the history gets is the empty one the turn was
-        # actually generated after, so the resent history is the engine's state byte for
-        # byte and prefix reuse can engage. Only the qwen36 renderer reads it.
-        preserve_thinking = body.get("preserve_thinking", not enable_thinking)
+        # by default with thinking on when the client sends no reasoning back: the block
+        # would come back empty where the model did think. On by default with thinking off:
+        # there the block the history gets is the empty one the turn was actually generated
+        # after. On, too, when the client sends the reasoning back (resends_reasoning): the
+        # block then carries what the model wrote. Either way the resent history is the
+        # engine's state byte for byte and prefix reuse can engage. Only the qwen36
+        # renderer reads it.
+        preserve_thinking = body.get("preserve_thinking",
+                                     preserve_thinking_default(body.get("messages"), enable_thinking))
         if not isinstance(preserve_thinking, bool):
             raise APIError(400, "`preserve_thinking` must be a boolean.", "preserve_thinking")
         # The request's shape is checked before the image expanders and the renderer read it.
@@ -7793,21 +8322,171 @@ class APIHandler(BaseHTTPRequestHandler):
                         not isinstance(params.get("required", []), list)):
                     raise APIError(400, "Strict tool schemas need object `parameters`, "
                                    "object `properties` and array `required`.", f"tools.{index}")
-        audio_clips = [] if ARCH == "inkling" else None
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise APIError(400, "`messages` must be a non-empty array.", "messages")
-        messages, image = self.expand_images(messages)
-        add_generation_prompt = resolve_generation_prompt(messages, body)
-        prompt = render_chat_for_arch(messages, enable_thinking, reasoning_effort,
-                                      tools, tool_choice, audio_out=audio_clips,
-                                      add_generation_prompt=add_generation_prompt,
-                                      preserve_thinking=preserve_thinking)
-        self.generation(body, prompt, request_id, True, tools, tool_choice,
-                        enable_thinking=enable_thinking,
-                        add_generation_prompt=add_generation_prompt,
-                        audio=b"".join(audio_clips) if audio_clips else None,
-                        image=image)
+        compact = compaction_requested(body)
+        render = dict(enable_thinking=enable_thinking, reasoning_effort=reasoning_effort,
+                      tools=tools, tool_choice=tool_choice, preserve_thinking=preserve_thinking)
+        lead, conversation = split_lead(messages)
+        keys = compaction_keys(lead, conversation) if compact else None
+        # a summary of the whole request would leave it without its question (a history cut
+        # back to where an earlier compaction began): only shorter prefixes count
+        done, summary = (self.server.compactions.find(keys[:len(conversation)]) if compact
+                         else (0, None))
+        report = None
+        for attempt in range(4):
+            view = messages if summary is None else with_summary(lead, summary) + conversation[done:]
+            if summary is not None:
+                report = {"summarized_messages": done, "summary": summary}
+            audio_clips = [] if ARCH == "inkling" else None
+            expanded, image = self.expand_images(view)
+            add_generation_prompt = resolve_generation_prompt(expanded, body)
+            prompt = render_chat_for_arch(expanded, enable_thinking, reasoning_effort,
+                                          tools, tool_choice, audio_out=audio_clips,
+                                          add_generation_prompt=add_generation_prompt,
+                                          preserve_thinking=preserve_thinking)
+            exceeded = self._context_pressure(body, prompt) if compact and attempt == 0 else None
+            if exceeded is None:
+                try:
+                    self.generation(body, prompt, request_id, True, tools, tool_choice,
+                                    enable_thinking=enable_thinking,
+                                    add_generation_prompt=add_generation_prompt,
+                                    audio=b"".join(audio_clips) if audio_clips else None,
+                                    image=image, compaction=report)
+                    return
+                except APIError as error:
+                    context = getattr(error, "context", None)
+                    if not compact or error.code != "context_length_exceeded" or not context:
+                        raise
+                    used, limit = context
+                    self.server.context_limit = limit
+                    if image is None and len(prompt) >= 256:
+                        self.server.note_prompt_size(prompt, {"prompt_tokens": used})
+                    exceeded = error
+            moved = self._compact(body, messages, lead, conversation, keys, done, summary, render)
+            if moved is None:
+                if isinstance(exceeded, APIError):
+                    raise exceeded
+                compact = False          # nothing older to summarize: let the engine fit the answer
+                continue
+            done, summary = moved
+        raise APIError(400, "The conversation does not fit the model's context even after "
+                            "summarizing it: the last message alone is too long.",
+                       "messages", "context_length_exceeded")
+
+    def _context_pressure(self, body, prompt):
+        """True when the prompt, by the measured tokens per character, leaves the answer
+        less room than it asks for (up to a quarter of the context): the engine would cut
+        the answer short, so the conversation is compacted first. None otherwise, and
+        always before the server has measured a prompt."""
+        limit = getattr(self.server, "context_limit", None)
+        ratio = getattr(self.server, "tokens_per_char", None)
+        if not limit or not ratio:
+            return None
+        try:
+            maximum = generation_options(body, self.server.max_tokens)[0]
+        except APIError:
+            return None
+        if len(prompt) * ratio + min(maximum, limit // 4) <= limit:
+            return None
+        return True
+
+    def _compact(self, body, messages, lead, conversation, keys, done, summary, render):
+        """Summarize the conversation before its last exchanges; (new done, new summary),
+        or None when there is nothing older left to summarize.
+
+        The summary is asked for after the history the engine already holds (everything
+        before the new user message), rendered as the conversation was, so the engine
+        prefills only the request to summarize. A range too long for that is halved."""
+        limit = getattr(self.server, "context_limit", None) or 4096
+        ratio = getattr(self.server, "tokens_per_char", None) or COMPACT_DEFAULT_RATIO
+        start = compaction_tail_start(conversation, done, ratio, int(limit * COMPACT_KEEP_SHARE))
+        if start is None:
+            return None
+        users = [i for i in range(done, len(conversation))
+                 if isinstance(conversation[i], dict) and conversation[i].get("role") == "user"]
+        end = users[-1]                   # the summary covers everything before the new request
+        if end <= done:
+            return None
+        words = max(80, min(400, limit // 24))
+        budget = min(768, max(160, limit // 8))
+        cache_slot = body.get("cache_slot")
+        if cache_slot is None and self.server.kv_slots > 1:
+            cache_slot = conversation_cache_slot(messages, self.server.kv_slots)
+        covered, text = done, summary
+        while covered < end:
+            # the longest range from `covered` whose request fits by the estimate (halved
+            # if the engine refuses it); what is left is summarized next, after the summary
+            # so far. Each request is a generation, minutes on a slow machine: as few as fit.
+            head = with_summary(lead, text)
+            room = (limit - budget - 64 - int(len(COMPACT_ASK) * ratio)
+                    - sum(estimate_message_tokens(m, ratio) for m in head))
+            upto = covered + 1
+            while upto < end and room - sum(estimate_message_tokens(m, ratio)
+                                            for m in conversation[covered:upto + 1]) >= 0:
+                upto += 1
+            while True:
+                part = self._summarize(with_summary(lead, text),
+                                       [without_images(m) for m in conversation[covered:upto]],
+                                       render, words, budget, cache_slot, limit, ratio)
+                if part is not None:
+                    break
+                half = covered + (upto - covered) // 2
+                if half <= covered:
+                    # one message longer than the context: say it was there, without it
+                    part = ((text.strip() + "\n\n") if text else "") + \
+                        f"[a message of {estimate_message_tokens(conversation[covered], ratio)} " \
+                        "tokens was too long to keep]"
+                    upto = covered + 1
+                    break
+                upto = half
+            covered, text = upto, part
+        self.server.compactions.remember(keys[start], text)
+        print(f"[compact] {start} messages summarized into {len(text)} characters "
+              f"(context {limit} tokens)", file=sys.stderr)
+        return start, text
+
+    def _summarize(self, head, part, render, words, budget, cache_slot, limit, ratio):
+        """The model's summary of head + part, or None when that and the summary's room do
+        not fit the context."""
+        ask = {"role": "user", "content": COMPACT_ASK.format(words=words)}
+
+        def rendered(thinking, effort):
+            return render_chat_for_arch(head + part + [ask], thinking, effort, render["tools"],
+                                        render["tool_choice"],
+                                        audio_out=[] if ARCH == "inkling" else None,
+                                        add_generation_prompt=True,
+                                        preserve_thinking=render["preserve_thinking"])
+        # the conversation's own flags, so the prompt begins as the engine's state does,
+        # with the reasoning block closed; a family whose block this cannot close (its
+        # thinking switch is not a marker at the end) is asked with thinking off instead
+        prompt, closed = close_open_thinking(rendered(render["enable_thinking"],
+                                                      render["reasoning_effort"]))
+        thinking = False
+        if not closed and starts_in_reasoning(render["enable_thinking"], True):
+            prompt, closed = close_open_thinking(rendered(False, None))
+            thinking = not closed and starts_in_reasoning(False, True)
+        if len(prompt) * ratio + budget > limit:
+            return None
+        output = []
+        try:
+            with self.server.scheduler.admit(self.client_disconnected, cache_slot) as admission:
+                _wait, slot = admission
+                self.server.generate(prompt, budget, 0.3, 0.9,
+                                     output.append, slot, self.client_disconnected)
+        except APIError as error:
+            if error.code == "context_length_exceeded":
+                return None
+            raise
+        text = "".join(output)
+        if ARCH == "inkling":
+            text, _reasoning = split_inkling(text)
+        else:
+            _reasoning, text = split_thinking_reply(text, thinking, True)
+        # it goes back in as a prompt, and a prompt refuses NUL bytes (a model can write one)
+        text = text.replace("\x00", "").strip()
+        return text or "[the earlier messages could not be summarized]"
 
     def expand_images(self, messages):
         """(messages with placeholders, the one image or None) for this engine's family.
@@ -8063,6 +8742,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 if not tools:
                     emit_text(chunk)
                     return
+                if qwen_stream is not None:
+                    qwen_stream.feed(chunk)
+                    return
                 if sideband.seen:
                     emit_text(chunk)
                     return
@@ -8080,6 +8762,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 if flush:
                     emit_text(state["buf"][:flush])
                     state["buf"] = state["buf"][flush:]
+
+            qwen_stream = (QwenToolStream(emit_text, tools) if tools and chat_flavor() in
+                           ("qwen36", "qwen38", "qwen3_coder") else None)
 
             def emit_thinking(chunk):
                 if not enable_thinking:
@@ -8127,7 +8812,9 @@ class APIHandler(BaseHTTPRequestHandler):
             if split:
                 split.close()
                 close_thinking()               # budget exhaustion before </think>
-            if tools and not state["in_tool"] and state["buf"]:
+            if qwen_stream is not None:
+                qwen_stream.finish()
+            elif tools and not state["in_tool"] and state["buf"]:
                 emit_text(state["buf"])
             ka_stop.set()
             ka_thread.join(timeout=2)
@@ -8167,8 +8854,8 @@ class APIHandler(BaseHTTPRequestHandler):
 def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
           cap=None, max_tokens=1024, engine=None, env=None, cors_origins=None,
           max_queue=8, queue_timeout=300, kv_slots=1, allowed_hosts=(), family=None):
-    if not 1 <= max_tokens:
-        raise ValueError("max_tokens must be positive")
+    if not 0 <= max_tokens:
+        raise ValueError("max_tokens cannot be negative (0: the context the engine holds)")
     if not 1 <= port <= 65535:
         raise ValueError("port must be between 1 and 65535")
     if max_queue < 0:
@@ -8243,6 +8930,9 @@ def serve(model, host="127.0.0.1", port=8000, model_id=None, api_key=None,
                       file=sys.stderr)
                 sys.exit(1)
         server.engine = runtime
+        server.context_limit = getattr(runtime, "context_limit", None)
+        if not max_tokens:   # the engine resolved it: the context it holds
+            server.max_tokens = getattr(runtime, "max_tokens", None) or 1024
         if family.modality != "image":
             # Said once at start-up, so a checkpoint that declares a tower it does
             # not carry is visible in the log and not only in a client's 400.
@@ -8291,7 +8981,9 @@ def main():
     # #379 -- glm arch resolves platform-aware, non-glm gets the legacy 8). An
     # explicit value, 0 included, reaches the engine verbatim.
     parser.add_argument("--cap", type=int, default=None, help="cache slots/layer (default: auto)")
-    parser.add_argument("--max-tokens", type=int, default=1024)
+    # 0: the context the engine holds (a turn ends when the model closes it or the
+    # context is full); a number is a ceiling every request is lowered to
+    parser.add_argument("--max-tokens", type=int, default=0)
     parser.add_argument("--max-queue", type=int, default=int(os.environ.get("COLI_MAX_QUEUE", "8")))
     parser.add_argument("--queue-timeout", type=float,
                         default=float(os.environ.get("COLI_QUEUE_TIMEOUT", "300")))

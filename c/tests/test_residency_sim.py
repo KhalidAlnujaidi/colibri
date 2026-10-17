@@ -95,6 +95,66 @@ class TraceParserTest(unittest.TestCase):
                     sim.parse_trace(path)
 
 
+class OlmoeProfileTest(unittest.TestCase):
+    def write(self, tmp, text):
+        path = Path(tmp) / "olmoe.trace"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_decode_call_fetches_in_rank_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "0 0 0 9:0.5 2:0.3 4:0.2\n1 0 1 1:1.0\n")
+            fetches = sim.read_traces([path], "olmoe")[0]
+        self.assertEqual([(e.layer, e.experts) for e in fetches],
+                         [(0, (9,)), (0, (2,)), (0, (4,)), (1, (1,))])
+
+    def test_prompt_blocks_fetch_each_expert_once_in_ascending_id(self):
+        old = sim.OLMOE_PREFILL_ROWS
+        sim.OLMOE_PREFILL_ROWS = 2
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self.write(
+                    tmp,
+                    "0 0 0 7:0.6 2:0.4\n"
+                    "0 1 0 2:0.7 5:0.3\n"
+                    "0 2 0 7:0.9 1:0.1\n",
+                )
+                fetches = sim.read_traces([path], "olmoe")[0]
+        finally:
+            sim.OLMOE_PREFILL_ROWS = old
+        self.assertEqual([e.experts[0] for e in fetches], [2, 5, 7, 1, 7])
+        self.assertEqual([e.selections for e in fetches],
+                         [(2, 2), (5,), (7,), (1,), (7,)])
+        counts = sim.training_counts([fetches])
+        self.assertEqual(counts[0], {2: 2, 5: 1, 7: 2, 1: 1})
+
+    def test_immediate_admission_differs_from_glm_batch_admission(self):
+        # A prompt routes experts 5 then 3; decode then routes 5. With one slot,
+        # OLMoE fetches 3 then 5 (ascending), so 5 is resident for decode. GLM
+        # admits the batch's misses together and keeps the last one, 3.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "0 0 0 5:1.0\n0 1 0 3:1.0\n1 0 0 5:1.0\n")
+            specs = {0: sim.LayerSpec(1, 1, 1.0, 8)}
+            olmoe = sim.run_policy("lru", {0: 1}, specs,
+                                   sim.read_traces([path], "olmoe")[0])
+            glm = sim.run_policy("lru", {0: 1}, specs,
+                                 sim.read_traces([path], "glm")[0])
+        self.assertEqual((olmoe.hits, olmoe.misses), (1, 2))
+        self.assertEqual((glm.hits, glm.misses), (0, 3))
+
+    def test_rows_with_different_widths_are_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "0 0 0 1:0.5 2:0.5\n0 1 0 3:1.0\n0 2 0 4:1.0\n")
+            with self.assertRaisesRegex(ValueError, "not an OLMoE trace"):
+                sim.read_traces([path], "olmoe")
+
+    def test_unknown_engine_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self.write(tmp, "0 0 0 1:1.0\n")
+            with self.assertRaisesRegex(ValueError, "unknown engine"):
+                sim.read_traces([path], "kimi_k3")
+
+
 class SpecificationTest(unittest.TestCase):
     def test_manifest_separates_resident_and_read_bytes(self):
         traces = [[sim.AccessEvent(3, (0, 1))]]
@@ -247,6 +307,37 @@ class PolicyBehaviorTest(unittest.TestCase):
         self.assertEqual(frequency.seeded_objects, 2)
         self.assertEqual(pinned.hits, 1)
         self.assertEqual(pinned.seeded_objects, 1)
+
+    def test_cold_controls_ignore_training_counts(self):
+        learned = {0: {7: 100, 8: 50}}
+        sequence = self.events([7, 8, 1, 7, 2, 8, 7])
+        for cold, seeded in (("lfu-cold", "lfu"), ("frequency-cold", "frequency")):
+            with self.subTest(policy=cold):
+                with_history = sim.run_policy(cold, {0: 2}, self.specs(), sequence, learned)
+                without = sim.run_policy(cold, {0: 2}, self.specs(), sequence)
+                self.assertEqual(with_history, without)
+                self.assertEqual(with_history.seeded_objects, 0)
+                self.assertNotEqual(
+                    sim.run_policy(seeded, {0: 2}, self.specs(), sequence, learned),
+                    without)
+
+    def test_warm_lru_starts_with_training_top_k(self):
+        learned = {0: {7: 100, 8: 50, 9: 1}}
+        warm = sim.run_policy("lru-warm", {0: 2}, self.specs(),
+                              self.events([7, 8, 9, 7]), learned)
+        self.assertEqual(warm.seeded_objects, 2)
+        self.assertEqual((warm.hits, warm.misses), (2, 2))
+        # 7 and 8 hit; 9 then evicts 7, the less recent, and 7 evicts 8.
+        self.assertEqual(warm.evictions, 2)
+
+    def test_warm_frequency_lets_session_counts_displace_seeds(self):
+        learned = {0: {7: 100, 8: 50}}
+        sequence = self.events([1, 1, 1, 1])
+        seeded = sim.run_policy("frequency", {0: 2}, self.specs(), sequence, learned)
+        warm = sim.run_policy("frequency-warm", {0: 2}, self.specs(), sequence, learned)
+        self.assertEqual(seeded.misses, 4)            # never outweighs a count of 50
+        self.assertEqual(warm.seeded_objects, 2)
+        self.assertEqual((warm.hits, warm.misses), (2, 2))
 
     def test_slru_protects_reused_objects_from_one_hit_scan(self):
         warm = [0, 1] * 20

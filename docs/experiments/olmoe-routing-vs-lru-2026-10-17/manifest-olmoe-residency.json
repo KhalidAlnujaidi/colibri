@@ -1,0 +1,84 @@
+{
+ "layers": {
+  "0": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "1": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "2": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "3": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "4": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "5": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "6": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "7": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "8": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "9": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "10": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "11": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "12": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "13": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "14": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  },
+  "15": {
+   "resident_bytes": 6307840,
+   "read_bytes": 6307840,
+   "max_experts": 64
+  }
+ }
+}

@@ -1,0 +1,122 @@
+[
+ {
+  "name": "chat_1",
+  "category": "chat",
+  "prompt_tokens": 29,
+  "ngen": 128,
+  "text": "User: I just moved to a new city and I don't know anyone. How can I make friends as an adult?\nAssistant:"
+ },
+ {
+  "name": "chat_2",
+  "category": "chat",
+  "prompt_tokens": 28,
+  "ngen": 128,
+  "text": "User: My sourdough starter smells like nail polish remover. Is it dead, and what should I do?\nAssistant:"
+ },
+ {
+  "name": "chat_3",
+  "category": "chat",
+  "prompt_tokens": 29,
+  "ngen": 128,
+  "text": "User: Can you help me plan a three-day trip to Lisbon on a modest budget? I like food and history.\nAssistant:"
+ },
+ {
+  "name": "chat_4",
+  "category": "chat",
+  "prompt_tokens": 22,
+  "ngen": 128,
+  "text": "User: What are some good ways to stay focused when working from home with kids around?\nAssistant:"
+ },
+ {
+  "name": "code_1",
+  "category": "code",
+  "prompt_tokens": 37,
+  "ngen": 128,
+  "text": "# Python 3\n# Write a function that returns the longest palindromic substring of s.\ndef longest_palindrome(s: str) -> str:\n"
+ },
+ {
+  "name": "code_2",
+  "category": "code",
+  "prompt_tokens": 49,
+  "ngen": 128,
+  "text": "// C\n// Implement a thread-safe bounded ring buffer with push and pop using pthread mutex and condition variables.\n#include <pthread.h>\n#include <stdlib.h>\n\ntypedef struct {\n"
+ },
+ {
+  "name": "code_3",
+  "category": "code",
+  "prompt_tokens": 51,
+  "ngen": 128,
+  "text": "-- SQL\n-- Tables: orders(id, customer_id, total, created_at), customers(id, name, country).\n-- Return the top 5 countries by total revenue in 2024, with the number of distinct customers.\nSELECT"
+ },
+ {
+  "name": "code_4",
+  "category": "code",
+  "prompt_tokens": 43,
+  "ngen": 128,
+  "text": "// Rust\n// Parse a CSV line respecting double-quoted fields with escaped quotes, returning Vec<String>.\nfn parse_csv_line(line: &str) -> Vec<String> {\n"
+ },
+ {
+  "name": "multilingual_1",
+  "category": "multilingual",
+  "prompt_tokens": 41,
+  "ngen": 128,
+  "text": "Pregunta: ¿Cuáles son las principales causas del cambio climático y qué pueden hacer los ciudadanos para reducir su impacto?\nRespuesta:"
+ },
+ {
+  "name": "multilingual_2",
+  "category": "multilingual",
+  "prompt_tokens": 37,
+  "ngen": 128,
+  "text": "Question : Pourquoi la Révolution française a-t-elle commencé en 1789 ? Expliquez les causes principales.\nRéponse :"
+ },
+ {
+  "name": "multilingual_3",
+  "category": "multilingual",
+  "prompt_tokens": 36,
+  "ngen": 128,
+  "text": "Frage: Wie funktioniert eine Wärmepumpe, und lohnt sie sich in einem älteren Haus?\nAntwort:"
+ },
+ {
+  "name": "multilingual_4",
+  "category": "multilingual",
+  "prompt_tokens": 59,
+  "ngen": 128,
+  "text": "سؤال: ما هي فوائد قراءة الكتب يوميًا، وكيف يمكن بناء عادة القراءة؟\nالجواب:"
+ },
+ {
+  "name": "longctx_1",
+  "category": "longctx",
+  "prompt_tokens": 1534,
+  "ngen": 128,
+  "source": "docs/cuda.md",
+  "excerpt_tokens": 1500,
+  "question": "Question: Summarize, in a few sentences, what the document above says about how experts are placed on the GPU and what limits it.\nAnswer:"
+ },
+ {
+  "name": "longctx_2",
+  "category": "longctx",
+  "prompt_tokens": 1529,
+  "ngen": 128,
+  "source": "docs/windows.md",
+  "excerpt_tokens": 1500,
+  "question": "Question: According to the document above, what are the main steps and pitfalls for running colibri on Windows?\nAnswer:"
+ },
+ {
+  "name": "longctx_3",
+  "category": "longctx",
+  "prompt_tokens": 1528,
+  "ngen": 128,
+  "source": "docs/api.md",
+  "excerpt_tokens": 1500,
+  "question": "Question: Based on the document above, describe the HTTP endpoints the server exposes and how a client should call them.\nAnswer:"
+ },
+ {
+  "name": "longctx_4",
+  "category": "longctx",
+  "prompt_tokens": 1523,
+  "ngen": 128,
+  "source": "docs/FORMATS.md",
+  "excerpt_tokens": 1500,
+  "question": "Question: Using the document above, explain the difference between the expert storage formats it describes.\nAnswer:"
+ }
+]

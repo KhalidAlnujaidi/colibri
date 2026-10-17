@@ -69,7 +69,8 @@
  *    must share one kind. A layer the tier should not serve (an MTP layer in another
  *    format) is simply never passed to vkt_issue: index layers 0..layers-1 only.
  *
- * 2. Warm start (optional, recommended when there is history): the tier plans, the
+ * 2. Warm start (recommended: with a history the hottest go first, and the rest of the
+ *    device is filled either way, COLI_VK_TIER_FILL): the tier plans, the
  *    engine reads each planned expert from disk (any number of threads) and hands
  *    it over, then publishes on the engine thread:
  *
@@ -132,6 +133,13 @@
  *   VKT_SRC_FP8_GS        e4m3, f32 per (row, gs)                -> fmt 12
  *   VKT_SRC_FP8_BLOCK     e4m3, f32 per gs x gs block            -> fmt 12 (qwen38 native)
  *   VKT_SRC_BF16, VKT_SRC_F32                                    -> fmt 11, 10
+ *   VKT_SRC_GGML + t      ggml block type t, rows as the GGUF stores them -> fmt 100 + t
+ *                         (no scales: they are in the blocks; shaders/blockdec.glsl)
+ *   VKT_SRC_LB_I2G32, _I2G16, _I3G16  colibri's int2-g32 / int2-g16 / int3-g16 codes, and
+ *                         as "scales" per matrix its group scales (I/32 bytes a row) then
+ *                         its f32 row scales                -> fmt 200, 201, 202
+ *   VKT_SRC_LB_VQ2        vq2's index bytes, as "scales" its 4-bit scales (I/64 bytes a
+ *                         row) then its f32 row scales; coli_vk_set_vq2_books first -> fmt 203
  * Activations (VktConfig.act): VKT_ACT_SWIGLU silu(g)*u, act_limit > 0 clamps the
  * gate from above and up to [-limit, limit] first (GLM-5.3, DeepSeek V4/V4.1);
  * VKT_ACT_SITU a*tanh(g/a)*sigmoid(g) * b*tanh(u/b) with act_a, act_b (Kimi K3);
@@ -151,7 +159,9 @@ typedef enum {
     VKT_SRC_I8_ROW, VKT_SRC_I8_GS, VKT_SRC_I8_AS_I4_ROW, VKT_SRC_I8_AS_I4_GS,
     VKT_SRC_I4S_PAIRS_ROW, VKT_SRC_I4S_PAIRS_GS, VKT_SRC_I4U_PAIRS_ROW, VKT_SRC_I4U_PAIRS_GS,
     VKT_SRC_I4U_PLANAR64, VKT_SRC_I3_G64, VKT_SRC_MXFP4_F32, VKT_SRC_MXFP4_E8M0,
-    VKT_SRC_FP8_GS, VKT_SRC_FP8_BLOCK, VKT_SRC_BF16, VKT_SRC_F32
+    VKT_SRC_FP8_GS, VKT_SRC_FP8_BLOCK, VKT_SRC_BF16, VKT_SRC_F32,
+    VKT_SRC_LB_I2G32, VKT_SRC_LB_I2G16, VKT_SRC_LB_I3G16, VKT_SRC_LB_VQ2,
+    VKT_SRC_GGML = 64                   /* + the ggml type: VKT_SRC_GGML + t, t < 43 */
 } VktSrc;
 typedef struct { VktSrc kind; int gs; } VktFmt;     /* gs: group (block) size, 0 = per row */
 
@@ -204,7 +214,14 @@ typedef struct {
      * main layers only). 0: none. */
     int extra_layers;
     VktFmt extra_gate_up, extra_down;
+    /* Optional: the main layers' forms when they differ by layer (a GGUF whose layers mix
+     * block types, as published ones do): layer_gate_up[l], layer_down[l] for l < layers,
+     * at most VKT_FORMS - 1 distinct pairs, gate_up/down among them or not; NULL = every
+     * layer gate_up/down. The arrays are read during vkt_init only. */
+    const VktFmt *layer_gate_up, *layer_down;
 } VktConfig;
+#define VKT_FORMS 8
+#define VKT_MAX_LAYERS 512
 
 
 #ifdef COLI_VULKAN
@@ -216,6 +233,9 @@ int  vkt_init(const VktConfig *cfg, uint32_t *const *heat);
 int  vkt_ready(void);
 void vkt_shutdown(void);
 int  vkt_plan(int *layers, int *eids, int max);
+/* The warm start's line ("[VK] tier <engine>: warm start, N experts in Xs (...)"): what
+ * came from the history and what filled the rest of the device (vkt_plan). */
+void vkt_warm_report(const char *engine, int n, double seconds);
 int  vkt_put(int layer, int eid, const VktExpertSrc *src);   /* any thread */
 void vkt_put_done(void);
 void vkt_note(int layer, int eid, const VktExpertSrc *src);
@@ -263,12 +283,27 @@ int  vkt_layers(void);
  * Any thread (the prefetch workers too): it reads the slot table without the engine. */
 int  vkt_ram_first(int layer, int eid);
 void vkt_ram_gave(void);
+/* The routed experts on the device (vk_chain.h, vkc_moe): an engine whose dense chain
+ * routes and computes a layer's experts there, with no host step, for the layers whose
+ * experts the tier holds on the primary device.
+ *   vkt_epoch       changes whenever a resident comes or goes (the engine thread's
+ *                   quiescent points: a vkt_issue, vkt_join, vkt_note or vkt_put_done);
+ *                   residents stay put between two of them
+ *   vkt_dev_table   layer's E entries for vkc_moe (COLI_VK_XB_ENTRY words each, a zero
+ *                   entry where the expert is not resident there); returns how many are,
+ *                   -1 when the device cannot read them by address
+ *   vkt_dev_count   the books for S rows of K experts the device computed (idx as
+ *                   vkt_issue's): heat, routed and served, as a vkt_issue that took them */
+unsigned vkt_epoch(void);
+int  vkt_dev_table(int layer, uint32_t *entries);
+void vkt_dev_count(int layer, int S, int K, const int *idx);
 #else
 static inline int  vkt_wanted(void){return 0;}
 static inline int  vkt_init(const VktConfig *c, uint32_t *const *h){(void)c;(void)h;return 0;}
 static inline int  vkt_ready(void){return 0;}
 static inline void vkt_shutdown(void){}
 static inline int  vkt_plan(int *l,int *e,int m){(void)l;(void)e;(void)m;return 0;}
+static inline void vkt_warm_report(const char *e,int n,double s){(void)e;(void)n;(void)s;}
 static inline int  vkt_put(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;return 0;}
 static inline void vkt_put_done(void){}
 static inline void vkt_note(int l,int e,const VktExpertSrc *s){(void)l;(void)e;(void)s;}
@@ -287,6 +322,9 @@ static inline int  vkt_devices(void){return 0;}
 static inline int  vkt_layers(void){return 0;}
 static inline int  vkt_ram_first(int l,int e){(void)l;(void)e;return 0;}
 static inline void vkt_ram_gave(void){}
+static inline unsigned vkt_epoch(void){return 0;}
+static inline int  vkt_dev_table(int l,uint32_t *e){(void)l;(void)e;return -1;}
+static inline void vkt_dev_count(int l,int S,int K,const int *i){(void)l;(void)S;(void)K;(void)i;}
 #endif
 
 #endif

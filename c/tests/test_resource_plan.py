@@ -34,7 +34,11 @@ def analyze_qwen38_mtp(model, env):
     return resource_plan._q38_mtp_head(info, env)
 
 
-def write_shard(path, tensors):
+# 1.0000001: an f32 that is not a bf16 widened (its low half is not zero)
+NOT_BF16 = struct.pack("<f", 1.0000001)
+
+
+def write_shard(path, tensors, f32_fill=None):
     offset = 0
     header = {}
     for tensor in tensors:
@@ -45,13 +49,24 @@ def write_shard(path, tensors):
                         "data_offsets": [offset, offset + size]}
         offset += size
     raw = json.dumps(header).encode()
-    # The planner reads headers and file sizes, not tensor values. Extending
-    # the file retains the zero-filled payload without allocating it in Python;
+    # The planner reads headers and file sizes, and the values of one kind of
+    # tensor only: an F32 matrix an engine uploads as bf16 when every value is
+    # one (resource_plan._bf16_exact), which zeros are. Extending the file
+    # retains the zero-filled payload without allocating it in Python;
     # filesystems supporting sparse extension also avoid writing gigabytes.
+    # f32_fill: the F32 tensors' values instead (NOT_BF16, as the engines' tiny
+    # fixtures, whose random values stay f32).
     with path.open("wb") as stream:
         stream.write(struct.pack("<Q", len(raw)))
         stream.write(raw)
-        stream.truncate(stream.tell() + offset)
+        base = stream.tell()
+        if f32_fill:
+            for meta in header.values():
+                if meta["dtype"] == "F32":
+                    start, end = meta["data_offsets"]
+                    stream.seek(base + start)
+                    stream.write(f32_fill * ((end - start) // 4))
+        stream.truncate(base + offset)
 
 
 class ShardFixtureTest(unittest.TestCase):
@@ -1437,6 +1452,51 @@ memInfo.free:                     23.50 GB (97%)
             self.assertNotIn("qwen38_int4_experts", partial["model"])
             self.assertEqual(partial["model"]["per_cap_bytes"], 384)
 
+    def test_qwen38_int2_sidecar_is_priced_when_the_engine_takes_it(self):
+        # Q38_EXPERT_INT2=1 makes qwen38 load experts-int2g32/ (int2_g32.h) instead of
+        # the int4 one: its records are what the cache holds, and nothing else
+        self.write_qwen38()
+        geometry = {"version": 1, "complete": True, "layers": 2, "experts": 2,
+                    "hidden_size": 8, "moe_intermediate_size": 4}
+        for name, fmt, record in (("experts-int4g64", "colibri.qwen38.experts-int4g64", 112),
+                                  ("experts-int2g32", "colibri.qwen38.experts-int2g32", 60)):
+            (self.model / name).mkdir()
+            (self.model / name / "index.json").write_text(json.dumps(dict(geometry, format=fmt, record_bytes=record)))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("Q38_EXPERT_INT4", None)
+            os.environ.pop("Q38_EXPERT_INT2", None)
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertEqual(plan["model"]["per_cap_bytes"], 112)
+            os.environ["Q38_EXPERT_INT2"] = "1"
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertTrue(plan["model"]["qwen38_int4_experts"])
+            self.assertEqual((plan["model"]["per_cap_bytes"], plan["model"]["expert_bytes"]), (60, 120))
+            os.environ.pop("Q38_EXPERT_INT2")
+            (self.model / "experts-int3g16").mkdir()
+            (self.model / "experts-int3g16" / "index.json").write_text(
+                json.dumps(dict(geometry, format="colibri.qwen38.experts-int3g16", record_bytes=86)))
+            with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "int3g16"}):
+                plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertEqual(plan["model"]["per_cap_bytes"], 86)
+            # the vector formats, and any name with a complete index of its own: priced by its
+            # record, never by the FP8 bytes (vq2 on the release once got a cap for 4.9 MB experts)
+            for name, record in (("vq2g32", 53), ("vq1g64", 33), ("newfmt7", 41)):
+                (self.model / f"experts-{name}").mkdir()
+                (self.model / f"experts-{name}" / "index.json").write_text(
+                    json.dumps(dict(geometry, format=f"colibri.qwen38.experts-{name}", record_bytes=record)))
+                with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": name}):
+                    plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+                self.assertEqual((name, plan["model"]["per_cap_bytes"]), (name, record))
+            with mock.patch.dict(os.environ, {"Q38_EXPERT_LOWBIT": "nosidecar"}):   # no index: not priced as one (the engine refuses it)
+                plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertNotIn("qwen38_int4_experts", plan["model"])
+            os.environ["Q38_EXPERT_INT2"] = "1"
+            # the int2 index of another format or still being written is not priced
+            (self.model / "experts-int2g32" / "index.json").write_text(
+                json.dumps(dict(geometry, format="colibri.qwen38.experts-int2g32", record_bytes=60, complete=False)))
+            plan = build_plan(self.model, context=64, available_memory=16 * GB, available_disk=16 * GB, gpus=[])
+            self.assertEqual(plan["model"]["per_cap_bytes"], 384)
+
     def test_cli_emits_versioned_json(self):
         cli = Path(__file__).parents[1] / "coli"
         run = subprocess.run([
@@ -1916,7 +1976,7 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
         write_shard(self.model / "model.safetensors", tensors)
         return analyze_model(self.model)
 
-    def write_olmoe(self):
+    def write_olmoe(self, f32_fill=NOT_BF16):
         """tools/make_olmoe_tiny.py's geometry as tools/convert_olmoe_merged.py writes it."""
         c = {"architectures": ["OlmoeForCausalLM"], "model_type": "olmoe", "hidden_size": 64,
              "intermediate_size": 32, "num_attention_heads": 4, "num_key_value_heads": 4, "num_experts": 8,
@@ -1936,8 +1996,48 @@ class VulkanPartialChainQwenOlmoeTest(unittest.TestCase):
             for e in range(8):
                 tensors.append((p + f"mlp.experts.{e}.merged_weight", 3 * 32 * 64, "I8", [3 * 32 * 64]))
                 tensors.append((p + f"mlp.experts.{e}.qs", (2 * 32 + 64) * 4, "F32", [2 * 32 + 64]))
-        write_shard(self.model / "model.safetensors", tensors)
+        write_shard(self.model / "model.safetensors", tensors, f32_fill=f32_fill)
         return analyze_model(self.model)
+
+    def test_olmoe_matrices_that_are_bf16_go_up_as_bf16(self):
+        """backend_vulkan.c coli_vk_f32_fmt: an f32 matrix whose every value is a bf16
+        widened goes up as bf16, fmt 11 (#2040), and the plan counts it so; zeros are,
+        the fixture's 1.0000001 is not. q, k, v, o and the router save half their rows,
+        lm_head is the tail at bf16."""
+        from resource_plan import _VK_CHAIN_LAYOUT, vk_tensor_bytes
+        cpu = {"type": "cpu", "budget_bytes": 64 * GB}
+        on = {"COLI_VULKAN": "1", "COLI_VK_CHAIN": "1"}
+        info = self.write_olmoe(f32_fill=None)
+        got = _VK_CHAIN_LAYOUT["olmoe"](info, on, cpu)
+        saved = (4 * (vk_tensor_bytes(10, 64, 64) - vk_tensor_bytes(11, 64, 64)) +
+                 vk_tensor_bytes(10, 64, 8) - vk_tensor_bytes(11, 64, 8))
+        self.assertEqual((got.layers, got.tail), ([168192 - saved] * 4, vk_tensor_bytes(11, 64, 128)))
+
+    def test_half_fmt_reads_the_dtype_and_the_values(self):
+        """backend_vulkan.c coli_vk_f32_fmt's rule from the checkpoint: bf16 (11) when every
+        value is a bf16, f16 (14) when every value is an f16, f32 (None) otherwise; a BF16
+        or F16 tensor from its header, an F32 one from its values."""
+        from resource_plan import _half_fmt
+        values = {"bf16": struct.pack("<4f", 1.0, -2.5, 0.0, 3.0),
+                  "f16": struct.pack("<4f", 1.0, 999 / 1024, 2.0 ** -20, -65504.0),
+                  "f32": struct.pack("<4f", 1.0, -2.5, 0.0, 1.0000001),
+                  "big": struct.pack("<4f", 1.0, 999 / 1024, 0.0, 70000.0)}
+        header, blob = {}, b""
+        for name, data in values.items():
+            header[f"{name}.weight"] = {"dtype": "F32", "shape": [4],
+                                        "data_offsets": [len(blob), len(blob) + len(data)]}
+            blob += data
+        for name, dtype in (("half", "BF16"), ("fp16", "F16"), ("fp8", "F8_E4M3")):
+            header[f"{name}.weight"] = {"dtype": dtype, "shape": [4], "data_offsets": [len(blob), len(blob) + 8]}
+            blob += b"\1" * 8
+        raw = json.dumps(header).encode()
+        (self.model / "model.safetensors").write_bytes(struct.pack("<Q", len(raw)) + raw + blob)
+        info = {"path": str(self.model),
+                "dense_tensors": [{"name": n, "dtype": h["dtype"]} for n, h in header.items()]}
+        self.assertEqual([_half_fmt(info, f"{n}.weight") for n in ("bf16", "f16", "f32", "big")],
+                         [11, 14, None, None])
+        self.assertEqual([_half_fmt(info, f"{n}.weight") for n in ("half", "fp16", "fp8", "missing")],
+                         [11, 14, None, None])   # from the header alone
 
     def test_layouts_are_the_engines(self):
         # "[VK] qwen36 chain fit: ... fixed X B (the engine's E B, ...), tail T B, layers ..." and
@@ -2268,7 +2368,7 @@ class VulkanPartialChainGlm53Test(unittest.TestCase):
                 for name in ("gate", "up", "down"):
                     add(p + f"mlp.experts.{e}.{name}_proj.weight", 8192, dtype="U8")
                     add(p + f"mlp.experts.{e}.{name}_proj.weight.qs", 256)
-        write_shard(self.model / "model.safetensors", tensors)
+        write_shard(self.model / "model.safetensors", tensors, f32_fill=NOT_BF16)
         self.info = analyze_model(self.model)
 
     def tearDown(self):
@@ -2363,7 +2463,7 @@ class VulkanPartialChainDskTest(unittest.TestCase):
 
     def write(self, config, tensors):
         (self.model / "config.json").write_text(json.dumps(config))
-        write_shard(self.model / "model.safetensors", tensors)
+        write_shard(self.model / "model.safetensors", tensors, f32_fill=NOT_BF16)
         return analyze_model(self.model)
 
     def write_v41(self):
@@ -2587,7 +2687,7 @@ class VulkanPartialChainInklingMimoTest(unittest.TestCase):
                 add(p + "mlp.shared_experts.down_proj", 2, 64, 32)
                 add(p + "mlp.experts.gate_up_proj", 8, 64, 64)
                 add(p + "mlp.experts.down_proj", 8, 64, 32)
-        write_shard(self.model / "model.safetensors", main)
+        write_shard(self.model / "model.safetensors", main, f32_fill=NOT_BF16)
         if container:
             (self.model / "dense-int4g64").mkdir()
             write_shard(self.model / "dense-int4g64" / "dense.safetensors", quant)
