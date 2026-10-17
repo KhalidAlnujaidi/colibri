@@ -550,12 +550,63 @@ class HalfPinnedLRUPolicy(BasePolicy):
             self.stats.admissions += 1
 
 
+def _training_ranked(learned_counts, layer, capacity):
+    counts = (learned_counts or {}).get(layer, {})
+    return sorted(counts, key=lambda expert: (-counts[expert], expert))[:capacity]
+
+
+class WarmLRUPolicy(LRUPolicy):
+    """Plain LRU starting with the training top-k resident.
+
+    `lru` starts cold while every history policy starts seeded; this control
+    separates the warm start from the replacement rule."""
+    def __init__(self, capacities, specs, learned_counts=None):
+        super().__init__(capacities, specs, learned_counts)
+        for layer, capacity in capacities.items():
+            ranked = _training_ranked(self.learned_counts, layer, capacity)
+            cache = self.cache[layer]
+            for expert in reversed(ranked):   # the most frequent ends up most recent
+                cache[expert] = None
+            self.stats.seeded_objects += len(ranked)
+
+
+class ColdLFUPolicy(LFUPolicy):
+    """`lfu` with the training traces dropped: it learns only from the trace it replays."""
+    def __init__(self, capacities, specs, learned_counts=None):
+        super().__init__(capacities, specs, None)
+
+
+class ColdFrequencyAdmissionPolicy(FrequencyAdmissionPolicy):
+    """`frequency` with the training traces dropped: it learns only from the trace it replays."""
+    def __init__(self, capacities, specs, learned_counts=None):
+        super().__init__(capacities, specs, None)
+
+
+class WarmFrequencyAdmissionPolicy(FrequencyAdmissionPolicy):
+    """`frequency` whose residents start as the training top-k, each counted once.
+
+    `frequency` seeds the training counts themselves, which can outweigh a
+    held-out session's own counts for the whole replay; here history picks
+    only the starting residents and the session's counts take over at once."""
+    def __init__(self, capacities, specs, learned_counts=None):
+        super().__init__(capacities, specs, None)
+        for layer, capacity in capacities.items():
+            ranked = _training_ranked(learned_counts, layer, capacity)
+            self.resident[layer].update(ranked)
+            self.frequency[layer].update(dict.fromkeys(ranked, 1))
+            self.stats.seeded_objects += len(ranked)
+
+
 POLICIES = {
     "lru": LRUPolicy,
     "half-pinned": HalfPinnedLRUPolicy,
     "lfu": LFUPolicy,
     "slru": SLRUPolicy,
     "frequency": FrequencyAdmissionPolicy,
+    "lru-warm": WarmLRUPolicy,
+    "lfu-cold": ColdLFUPolicy,
+    "frequency-cold": ColdFrequencyAdmissionPolicy,
+    "frequency-warm": WarmFrequencyAdmissionPolicy,
 }
 
 
@@ -998,7 +1049,7 @@ def print_report(result):
               f"unused_bytes={unused}")
         for policy, payload in policies.items():
             stats = payload["aggregate"]
-            print(f"{allocation:18} {policy:11} {stats['hit_rate']:8.2%} "
+            print(f"{allocation:22} {policy:14} {stats['hit_rate']:8.2%} "
                   f"{stats['misses']:7d} {stats['bytes_read']:12d} "
                   f"{stats['felt_wait_us']/1000:12.3f} "
                   f"{stats['evictions']:9d} {stats['rejected_admissions']:8d} "
@@ -1012,7 +1063,7 @@ def print_gate(gate):
     print("allocation policy verdict category_mean worst_category aggregate")
     for candidate in gate["candidates"]:
         verdict = "PASS" if candidate["pass"] else "FAIL"
-        print(f"{candidate['allocation']:18} {candidate['policy']:11} {verdict:7} "
+        print(f"{candidate['allocation']:22} {candidate['policy']:14} {verdict:7} "
               f"{candidate['category_mean_gain']:13.2%} "
               f"{candidate['worst_category_gain']:14.2%} "
               f"{candidate['aggregate_gain']:9.2%}")
@@ -1109,7 +1160,7 @@ def command_demo(args):
         print("\n=== synthetic budget operating regions ===")
         print("budget_mb allocation policy category_mean worst_category sensitivity")
         for row in sweep:
-            print(f"{row['budget_mb']:9d} {row['allocation']:18} {row['policy']:11} "
+            print(f"{row['budget_mb']:9d} {row['allocation']:22} {row['policy']:14} "
                   f"{row['category_mean_gain']:13.2%} "
                   f"{row['worst_category_gain']:14.2%} "
                   f"{'PASS' if row['pass_sensitivity'] else 'FAIL'}")

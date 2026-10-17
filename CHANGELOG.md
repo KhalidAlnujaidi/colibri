@@ -17,6 +17,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
   fetch, immediate admission into the per-layer LRU, 128-row prompt blocks in
   ascending expert id), so expert-placement policies can be compared on a model
   that runs on a CPU-only machine.
+- `residency_sim.py` control policies: `lru-warm` (LRU starting with the
+  training top-k), `lfu-cold` and `frequency-cold` (the training counts
+  dropped), `frequency-warm` (history picks the starting residents only). They
+  separate what routing history adds from what the replacement rule does; the
+  OLMoE held-out record (`docs/experiments/olmoe-routing-vs-lru-2026-10-17.md`)
+  uses them.
 
 ## [2.0.0] - 2026-10-06
 

@@ -308,6 +308,37 @@ class PolicyBehaviorTest(unittest.TestCase):
         self.assertEqual(pinned.hits, 1)
         self.assertEqual(pinned.seeded_objects, 1)
 
+    def test_cold_controls_ignore_training_counts(self):
+        learned = {0: {7: 100, 8: 50}}
+        sequence = self.events([7, 8, 1, 7, 2, 8, 7])
+        for cold, seeded in (("lfu-cold", "lfu"), ("frequency-cold", "frequency")):
+            with self.subTest(policy=cold):
+                with_history = sim.run_policy(cold, {0: 2}, self.specs(), sequence, learned)
+                without = sim.run_policy(cold, {0: 2}, self.specs(), sequence)
+                self.assertEqual(with_history, without)
+                self.assertEqual(with_history.seeded_objects, 0)
+                self.assertNotEqual(
+                    sim.run_policy(seeded, {0: 2}, self.specs(), sequence, learned),
+                    without)
+
+    def test_warm_lru_starts_with_training_top_k(self):
+        learned = {0: {7: 100, 8: 50, 9: 1}}
+        warm = sim.run_policy("lru-warm", {0: 2}, self.specs(),
+                              self.events([7, 8, 9, 7]), learned)
+        self.assertEqual(warm.seeded_objects, 2)
+        self.assertEqual((warm.hits, warm.misses), (2, 2))
+        # 7 and 8 hit; 9 then evicts 7, the less recent, and 7 evicts 8.
+        self.assertEqual(warm.evictions, 2)
+
+    def test_warm_frequency_lets_session_counts_displace_seeds(self):
+        learned = {0: {7: 100, 8: 50}}
+        sequence = self.events([1, 1, 1, 1])
+        seeded = sim.run_policy("frequency", {0: 2}, self.specs(), sequence, learned)
+        warm = sim.run_policy("frequency-warm", {0: 2}, self.specs(), sequence, learned)
+        self.assertEqual(seeded.misses, 4)            # never outweighs a count of 50
+        self.assertEqual(warm.seeded_objects, 2)
+        self.assertEqual((warm.hits, warm.misses), (2, 2))
+
     def test_slru_protects_reused_objects_from_one_hit_scan(self):
         warm = [0, 1] * 20
         sequence = warm + sum(([cold, 0, 1] for cold in range(2, 22)), [])

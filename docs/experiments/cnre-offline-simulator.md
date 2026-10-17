@@ -17,6 +17,11 @@ and OLMoE's with `--engine olmoe` (below). For GLM it models:
 - equal slots per layer versus policy-specific, trace-trained layer budgets;
 - GLM LRU, synthetic half-capacity pins + LRU, decayed LFU, segmented LRU,
   and decayed-frequency admission.
+- four controls that split what routing history adds from what the
+  replacement rule does: `lru-warm` (LRU starting with the training top-k),
+  `lfu-cold` and `frequency-cold` (`lfu` and `frequency` learning only from the
+  trace they replay), and `frequency-warm` (the training top-k as starting
+  residents, each counted once, so the replayed session's counts take over).
 
 The half-pinned and alternative admission policies are experiments, not exact
 reproductions of current GLM startup pins or live `REPIN`.
@@ -267,11 +272,21 @@ first useful campaign needs:
    prefill chunk, and frozen `.coli_usage` snapshot.
 4. Separate instrumentation fixes and engine profiles before Kimi K3, Inkling,
    or OLMoE data is interpreted by this simulator. OLMoE's instrumentation fix
-   (it emitted no route records) has landed, so only its engine profile and a
-   trace campaign remain.
+   (it emitted no route records) has landed, and so have its engine profile and
+   a first trace campaign (below).
 
 No server is required to run the simulator. A model-capable machine is needed
 only to collect missing traces and later validate a policy end to end.
+
+## OLMoE held-out result
+
+[olmoe-routing-vs-lru-2026-10-17.md](olmoe-routing-vs-lru-2026-10-17.md):
+16 real OLMoE-1B-7B traces (chat, code, multilingual, long context), held out
+within and across categories, 8 to 48 slots per layer. The seeded history
+policies (`frequency`, `lfu`, `half-pinned`) fail the gate at every budget and
+lose heavily on chat and multilingual. `frequency-cold` passes at every budget
+(12.7% to 22.4% less felt wait, no category worse than LRU), and history used
+only as a warm start saves about one miss per expert it seeds.
 
 ## H200 pilot result
 
